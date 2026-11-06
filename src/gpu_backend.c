@@ -731,15 +731,17 @@ static void texdump_poll(void)
 }
 static void texdump(const Nv2aTexture *t)
 {
-    static uint64_t seen[1024]; static unsigned nseen;
+    static uint64_t seen[16384]; static unsigned nseen;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint64_t h = hash_bytes(mem + t->offset, tex_bytes(t));
+    uint64_t h;
     uint32_t *argb, k, hdr[13];
     char path[512];
     FILE *f;
-    if (t->color == 0x0B && t->palette) h ^= hash_bytes(mem + t->palette, 1024) * 31u;
+    if (t->color == 0x1E && t->width >= 640) return;   /* the full-frame copy: new every frame, and not artwork */
+    h = hash_bytes(mem + t->offset, tex_bytes(t));
+    if (t->color == 0x0B && t->palette) h ^= hash_bytes(mem + t->palette, 1024) * 31u;
     for (k = 0; k < nseen; k++) if (seen[k] == h) return;
-    if (nseen == 1024) return;
+    if (nseen == 16384) return;
     seen[nseen++] = h;
     if (!(argb = (uint32_t *)malloc((size_t)t->width * t->height * 4))) return;
     if (!nv2a_backend_decode_texture(t, argb)) { free(argb); return; }

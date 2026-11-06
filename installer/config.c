@@ -31,6 +31,7 @@ static const int V_WIN[] = { 1, 2, 3, 4 };
 
 static Opt s_opts[] = {
     { "Render Scale", "resolution_scale", 5, T_RES, V_RES, 0 },
+    { "Upscaling", "upscaling", 2, T_OFFON, V_OFFON, 0 },
     { "Fullscreen", "fullscreen", 2, T_OFFON, V_OFFON, 1 },
     { "Window size", "window_scale", 4, T_WIN, V_WIN, 1 },
     { "Stretch image", "stretch", 2, T_STRETCH, V_OFFON, 0 },

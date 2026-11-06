@@ -36,7 +36,7 @@ static int s_cw, s_ch, s_ox, s_oy;
 static int s_pad_valid, s_unblock_wait;
 static DWORD s_unblock_t;
 
-static int s_scale = 1, s_msaa = 1, s_aniso = 1, s_stretch, s_vsync = 1;
+static int s_scale = 1, s_msaa = 1, s_aniso = 1, s_stretch, s_vsync = 1, s_upscaling;
 
 /* ---- settings.ini ------------------------------------------------------- */
 
@@ -68,10 +68,10 @@ static void cfg_put(const char *key, int v)
 
 /* ---- the menu's lines ---------------------------------------------------- */
 
-enum { IT_RES, IT_FS, IT_STRETCH, IT_VSYNC, IT_AA, IT_ANISO, IT_CLOSE, IT_QUIT, SET_ITEMS };
+enum { IT_RES, IT_UP, IT_FS, IT_STRETCH, IT_VSYNC, IT_AA, IT_ANISO, IT_CLOSE, IT_QUIT, SET_ITEMS };
 
 static const char *const SET_LABEL[SET_ITEMS] = {
-    "Render Scale", "Fullscreen", "Stretch image", "VSync", "Anti-aliasing", "Anisotropic filter", "Close menu", "Quit game" };
+    "Render Scale", "Upscaling", "Fullscreen", "Stretch image", "VSync", "Anti-aliasing", "Anisotropic filter", "Close menu", "Quit game" };
 static const char *const SET_RES[5] = { "1x  640x480 (Native)", "2x  1280x960", "3x  1920x1440", "4x  2560x1920", "5x  3200x2400" };
 static const char *const SET_OFFON[2] = { "Off", "On" };
 static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
@@ -85,7 +85,7 @@ static int set_count(int i)
     switch (i) {
     case IT_RES: case IT_ANISO: return 5;
     case IT_AA: return 4;
-    case IT_FS: case IT_STRETCH: case IT_VSYNC: return 2;
+    case IT_UP: case IT_FS: case IT_STRETCH: case IT_VSYNC: return 2;
     }
     return 0;
 }
@@ -94,6 +94,7 @@ static int set_get(int i)
 {
     switch (i) {
     case IT_RES: return s_scale - 1;
+    case IT_UP: return s_upscaling;
     case IT_FS: return xbox_fb_is_fullscreen() ? 1 : 0;
     case IT_STRETCH: return s_stretch;
     case IT_VSYNC: return s_vsync;
@@ -111,7 +112,7 @@ static const char *set_text(int i)
     case IT_STRETCH: return SET_STRETCH[v];
     case IT_AA: return SET_AA[v];
     case IT_ANISO: return SET_ANISO[v];
-    case IT_FS: case IT_VSYNC: return SET_OFFON[v];
+    case IT_UP: case IT_FS: case IT_VSYNC: return SET_OFFON[v];
     }
     return "";
 }
@@ -120,6 +121,7 @@ static void set_put(int i, int v)
 {
     switch (i) {
     case IT_RES: s_scale = v + 1; cfg_put("resolution_scale", s_scale); break;
+    case IT_UP: s_upscaling = v; cfg_put("upscaling", v); gpu_present_set_upscale(v); break;
     case IT_FS: xbox_fb_toggle_fullscreen(); break;
     case IT_STRETCH: s_stretch = v; cfg_put("stretch", v); gpu_present_set_stretch(v); break;
     case IT_VSYNC: s_vsync = v; cfg_put("vsync", v); gpu_present_set_vsync(v); break;
@@ -252,8 +254,8 @@ static void draw_settings(void)
     SelectObject(c.mdc, fh);
     SetTextColor(c.mdc, RGB(150, 162, 182));
     SetRect(&rr, dx + rh / 3, dy + rh * 14 / 10 + SET_ITEMS * rh + rh / 6, dx + dw - rh / 3, dy + dh - rh / 8);
-    DrawTextA(c.mdc, "Up/Down choose, Left/Right change, Enter or A confirms. Saved automatically. Render scale and "
-              "filters apply when you close this. F1, Esc or B closes.", -1, &rr, DT_LEFT | DT_WORDBREAK);
+    DrawTextA(c.mdc, "Up/Down choose, Left/Right change, Enter or A confirms. Saved automatically. Render scale, anti-aliasing "
+              "and anisotropic filtering apply when you close this. F1, Esc or B closes.", -1, &rr, DT_LEFT | DT_WORDBREAK);
     SelectObject(c.mdc, oldf);
     DeleteObject(ft); DeleteObject(fr); DeleteObject(fh);
     canvas_end(&c, dx, dy, dw, dh);
@@ -521,6 +523,8 @@ void mvc2_overlay_init(void)
     s_vsync = cfg_get("vsync", 1) != 0;
     if (getenv("RECOMP_PRESENT_VSYNC"))             /* a developer's explicit choice */
         s_vsync = getenv("RECOMP_PRESENT_VSYNC")[0] != '0';
+    s_upscaling = cfg_get("upscaling", 0) != 0;
+    gpu_present_set_upscale(s_upscaling);
     gpu_present_set_stretch(s_stretch);
     gpu_present_set_vsync(s_vsync);
     mvc2_video_request(s_scale, s_msaa, s_aniso);

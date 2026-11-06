@@ -36,6 +36,8 @@ def manifest():
     settings = [
         setting('scale', 'Render scale', 'display/resolution_scale', [(f'{n}x', n) for n in range(1, 6)], 1,
                 '1x is the original 640x480; higher draws the game sharper but needs a faster graphics card.'),
+        setting('upscaling', 'Upscaling', 'display/upscaling', toggle, 0,
+                'Sharper resampling and sharpening when the picture is shown larger than it is drawn.'),
         setting('fullscreen', 'Fullscreen', 'display/fullscreen', toggle, 1,
                 'Big Picture mode always starts fullscreen.'),
         setting('window-size', 'Window size', 'display/window_scale',

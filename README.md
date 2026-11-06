@@ -11,6 +11,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 ## Features
 
 - Direct3D 11 rendering, with render scale from 1x to 5x (640x480 to 3200x2400).
+- An upscaler (Lanczos resampling and contrast-adaptive sharpening) for when the picture is shown larger than it is drawn.
 - Anti-aliasing (MSAA up to 8x) and anisotropic filtering up to 16x.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.

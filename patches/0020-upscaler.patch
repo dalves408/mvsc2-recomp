@@ -1,0 +1,182 @@
+diff --git a/src/video/gpu_present.h b/src/video/gpu_present.h
+--- a/src/video/gpu_present.h
++++ b/src/video/gpu_present.h
+@@ -17,6 +17,7 @@ void gpu_present_set_source(void *shared_handle, uint32_t width, uint32_t height
+ void gpu_present_frame_ready(void);
+ void gpu_present_set_vsync(int on);
+ void gpu_present_set_stretch(int on);       /* fill the window instead of keeping the frame's shape */
++void gpu_present_set_upscale(int on);       /* Lanczos and sharpening when the frame is shown larger than drawn */
+ int  gpu_present_idle_ms(void);             /* how long the window loop waits when nothing was shown */
+ void gpu_present_shutdown(void);
+ #endif
+diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
+--- a/src/video/gpu_present.c
++++ b/src/video/gpu_present.c
+@@ -46,6 +46,7 @@ static ID3D11ShaderResourceView *s_src_srv;
+ static IDXGIKeyedMutex          *s_src_mutex;
+ static uint32_t                  s_src_tw, s_src_th;
+ static volatile int              s_stretch;
++static volatile int              s_upscale;
+ static HWND                      s_hwnd;
+ static uint32_t                  s_w, s_h;      /* frame size */
+ static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
+@@ -80,6 +81,99 @@ void gpu_present_set_source(void *shared_handle, uint32_t width, uint32_t height
+ void gpu_present_frame_ready(void) { InterlockedIncrement(&s_src_serial); }
+ void gpu_present_set_vsync(int on) { s_vsync = on != 0; }
+ void gpu_present_set_stretch(int on) { s_stretch = on != 0; }
++void gpu_present_set_upscale(int on) { s_upscale = on != 0; }
++
++/* Upscaling: when the frame is shown larger than it was drawn, a Lanczos-3 resample (overshoot clamped to the
++ * neighbouring pixels) followed by contrast-adaptive sharpening, instead of a bilinear stretch. Two passes: the resample
++ * into a viewport-sized texture, then the sharpening into the back buffer. src = size, 1 / size. */
++static const char s_up_hlsl[] =
++    "Texture2D t0 : register(t0);\n"
++    "cbuffer C : register(b0) { float4 src; };\n"
++    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
++    "static const float PI = 3.14159265;\n"
++    "float lz(float x) { x = abs(x); if (x < 1e-4) return 1.0; if (x >= 3.0) return 0.0;\n"
++    "  float a = PI * x; return 3.0 * sin(a) * sin(a / 3.0) / (a * a); }\n"
++    "float3 ld(int2 p) { p = clamp(p, int2(0, 0), int2(src.xy) - 1); return t0.Load(int3(p, 0)).rgb; }\n"
++    "float4 ps_up(V i) : SV_Target {\n"
++    "  float2 pos = i.uv * src.xy - 0.5; int2 p0 = (int2)floor(pos); float2 f = pos - p0;\n"
++    "  float wx[6], wy[6]; float sx = 0, sy = 0;\n"
++    "  [unroll] for (int k = 0; k < 6; k++) { wx[k] = lz(k - 2 - f.x); wy[k] = lz(k - 2 - f.y); sx += wx[k]; sy += wy[k]; }\n"
++    "  float3 acc = 0;\n"
++    "  [unroll] for (int y = 0; y < 6; y++) { float3 row = 0;\n"
++    "    [unroll] for (int x = 0; x < 6; x++) row += ld(p0 + int2(x - 2, y - 2)) * wx[x];\n"
++    "    acc += row * wy[y]; }\n"
++    "  acc /= (sx * sy);\n"
++    "  float3 a = ld(p0), b = ld(p0 + int2(1, 0)), c = ld(p0 + int2(0, 1)), d = ld(p0 + int2(1, 1));\n"
++    "  float3 mn = min(min(a, b), min(c, d)), mx = max(max(a, b), max(c, d));\n"
++    "  return float4(clamp(acc, mn, mx), 1.0); }\n"
++    "float4 ps_cas(V i) : SV_Target {\n"
++    "  int2 p = (int2)(i.uv * src.xy);\n"
++    "  float3 b = ld(p + int2(0, -1)), d = ld(p + int2(-1, 0)), e = ld(p), f = ld(p + int2(1, 0)), h = ld(p + int2(0, 1));\n"
++    "  float3 mn = min(min(d, e), min(f, min(b, h))), mx = max(max(d, e), max(f, max(b, h)));\n"
++    "  float3 amp = saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)); amp = sqrt(amp);\n"
++    "  float3 w = amp * (-1.0 / lerp(8.0, 5.0, 0.6));\n"
++    "  float3 r = (w * (b + d + f + h) + e) / (1.0 + 4.0 * w);\n"
++    "  return float4(saturate(r), 1.0); }\n";
++static ID3D11PixelShader        *s_up_ps, *s_cas_ps;
++static int                       s_up_fail;
++static ID3D11Texture2D          *s_up_tex;
++static ID3D11RenderTargetView   *s_up_rtv;
++static ID3D11ShaderResourceView *s_up_srv;
++static uint32_t                  s_up_w, s_up_h;
++
++static void up_release_target(void)
++{
++    if (s_up_srv) { ID3D11ShaderResourceView_Release(s_up_srv); s_up_srv = NULL; }
++    if (s_up_rtv) { ID3D11RenderTargetView_Release(s_up_rtv); s_up_rtv = NULL; }
++    if (s_up_tex) { ID3D11Texture2D_Release(s_up_tex); s_up_tex = NULL; }
++    s_up_w = s_up_h = 0;
++}
++
++static int up_ready(uint32_t w, uint32_t h)
++{
++    if (!s_up_ps && !s_up_fail) {
++        ID3DBlob *b0 = NULL, *b1 = NULL;
++        s_up_fail = 1;
++        D3DCompile(s_up_hlsl, sizeof s_up_hlsl - 1, "up", NULL, NULL, "ps_up", "ps_4_0", 0, 0, &b0, NULL);
++        D3DCompile(s_up_hlsl, sizeof s_up_hlsl - 1, "up", NULL, NULL, "ps_cas", "ps_4_0", 0, 0, &b1, NULL);
++        if (b0 && b1
++            && SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b0), ID3D10Blob_GetBufferSize(b0), NULL, &s_up_ps))
++            && SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b1), ID3D10Blob_GetBufferSize(b1), NULL, &s_cas_ps)))
++            s_up_fail = 0;
++        if (b0) ID3D10Blob_Release(b0);
++        if (b1) ID3D10Blob_Release(b1);
++        if (s_up_fail) fprintf(stderr, "  [D3D] upscaler shaders failed; using the plain stretch\n");
++    }
++    if (s_up_fail)
++        return 0;
++    if (s_up_tex && s_up_w == w && s_up_h == h)
++        return 1;
++    up_release_target();
++    {
++        D3D11_TEXTURE2D_DESC td;
++        ZeroMemory(&td, sizeof td);
++        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_up_tex))
++            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_up_tex, NULL, &s_up_rtv))
++            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_up_tex, NULL, &s_up_srv))) {
++            up_release_target();
++            return 0;
++        }
++    }
++    s_up_w = w; s_up_h = h;
++    return 1;
++}
++
++static void cb_set(float a, float b, float c, float d)
++{
++    D3D11_MAPPED_SUBRESOURCE m;
++    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
++        float *p = (float *)m.pData;
++        p[0] = a; p[1] = b; p[2] = c; p[3] = d;
++        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
++    }
++}
+ int  gpu_present_idle_ms(void) { return s_src_handle && !s_vsync ? 1 : 16; }
+ 
+ static void source_close(void)
+@@ -294,7 +388,6 @@ int gpu_present_frame(const uint32_t *pixels)
+     int use_src, resized = 0;
+     LONG serial = s_src_serial;
+     ID3D11ShaderResourceView *show;
+-    D3D11_MAPPED_SUBRESOURCE m;
+ 
+     if (!s_rtv || !pixels)
+         return 0;
+@@ -336,16 +429,35 @@ int gpu_present_frame(const uint32_t *pixels)
+     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+-    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+-        float *c = (float *)m.pData;
+-        c[0] = (float)fw; c[1] = (float)fh; c[2] = (float)fw / vp.Width; c[3] = (float)fh / vp.Height;
+-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
+-    }
+     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+     if (use_src && FAILED(IDXGIKeyedMutex_AcquireSync(s_src_mutex, 0, 50)))
+         return 0;                       /* the back end has it: the next pass shows it */
+-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &show);
+     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_samp);
++    {
++        uint32_t uw = (uint32_t)vp.Width, uh = (uint32_t)vp.Height;
++        if (s_upscale && uw && uh && (uint64_t)uw * uh > (uint64_t)fw * fh && up_ready(uw, uh)) {
++            D3D11_VIEWPORT uvp = vp;
++            ID3D11ShaderResourceView *none = NULL;
++            uvp.TopLeftX = uvp.TopLeftY = 0;
++            /* pass 1: resample to the shown size */
++            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_up_rtv, NULL);
++            ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &uvp);
++            cb_set((float)fw, (float)fh, 1.0f / (float)fw, 1.0f / (float)fh);
++            ID3D11DeviceContext_PSSetShader(s_ctx, s_up_ps, NULL, 0);
++            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &show);
++            ID3D11DeviceContext_Draw(s_ctx, 3, 0);
++            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
++            /* pass 2: sharpen into the window */
++            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
++            ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
++            cb_set((float)uw, (float)uh, 1.0f / (float)uw, 1.0f / (float)uh);
++            ID3D11DeviceContext_PSSetShader(s_ctx, s_cas_ps, NULL, 0);
++            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_up_srv);
++        } else {
++            cb_set((float)fw, (float)fh, (float)fw / vp.Width, (float)fh / vp.Height);
++            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &show);
++        }
++    }
+     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+     {
+         ID3D11ShaderResourceView *none = NULL;
+@@ -365,6 +477,9 @@ int gpu_present_frame(const uint32_t *pixels)
+ void gpu_present_shutdown(void)
+ {
+     source_close();
++    up_release_target();
++    if (s_cas_ps) { ID3D11PixelShader_Release(s_cas_ps);      s_cas_ps = NULL; }
++    if (s_up_ps) { ID3D11PixelShader_Release(s_up_ps);        s_up_ps = NULL; }
+     if (s_cb)    { ID3D11Buffer_Release(s_cb);                s_cb = NULL; }
+     if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
+     if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
