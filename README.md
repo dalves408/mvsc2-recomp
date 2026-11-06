@@ -12,7 +12,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 
 - Direct3D 11 rendering, with render scale from 1x to 5x (640x480 to 3200x2400).
 - An upscaler (Lanczos resampling and contrast-adaptive sharpening) for when the picture is shown larger than it is drawn.
-- Support for a hi-res texture pack for stages and menus. No pack is included; put PNGs named by a hash of their colors in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
+- Support for a hi-res texture pack for stages and menus. No pack is included; put DDS or PNG files named by hashes of their colors and transparency in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
 - Xbox One, Series and 360 controllers through XInput: up to 4 players, hot-plug and rumble.

@@ -603,11 +603,12 @@ static int tex_ok(const Nv2aTexture *t)
     return 0;
 }
 /* ---- hi-res texture pack ---------------------------------------------------
- * <16 hex digits of pixel_hash>*.dds or .png in %LOCALAPPDATA%\MvC2Recomp\texture_pack or a texture_pack folder
+ * <16 hex digits of pixel_hash>_<16 hex digits of alpha_hash>*.dds or .png in %LOCALAPPDATA%\MvC2Recomp\texture_pack or a texture_pack folder
  * next to the exe (subfolders allowed) replace the decoded texture of that hash, any size. The hash covers the decoded
- * colours only, so a pack can be made from the disc without running the game. The pack only holds stages and menus:
+ * colours only, so a pack can be made from the disc without running the game. The game can draw the same colours with
+ * other alpha than the disc holds, so a replacement whose alpha_hash differs is not used: the original is drawn instead. The pack only holds stages and menus:
  * character sprites are packed into sheets that change every frame, so no hash of theirs ever repeats. */
-typedef struct { uint64_t hash; char path[MAX_PATH]; } PackEnt;
+typedef struct { uint64_t hash, alpha; char path[MAX_PATH]; } PackEnt;
 static PackEnt *s_pack;
 static int s_npack, s_pack_cap, s_pack_scanned;
 static volatile int s_want_hires = 1;
@@ -625,7 +626,8 @@ static void pack_scan(const char *dir, int depth)
         if (fd.cFileName[0] == '.') continue;
         if (snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName) >= (int)sizeof sub) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (depth < 4) pack_scan(sub, depth + 1); continue; }
-        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".dds")) && strspn(fd.cFileName, "0123456789abcdefABCDEF") >= 16) {
+        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".dds")) && strspn(fd.cFileName, "0123456789abcdefABCDEF") == 16 && fd.cFileName[16] == '_'
+            && n > 38 && strspn(fd.cFileName + 17, "0123456789abcdefABCDEF") == 16) {
             char hex[17];
             if (s_npack == s_pack_cap) {
                 int cap = s_pack_cap ? s_pack_cap * 2 : 1024;
@@ -635,6 +637,8 @@ static void pack_scan(const char *dir, int depth)
             }
             memcpy(hex, fd.cFileName, 16); hex[16] = 0;
             s_pack[s_npack].hash = strtoull(hex, NULL, 16);
+            memcpy(hex, fd.cFileName + 17, 16);
+            s_pack[s_npack].alpha = strtoull(hex, NULL, 16);
             strcpy(s_pack[s_npack].path, sub);
             s_npack++;
         }
@@ -691,6 +695,18 @@ static uint64_t pixel_hash(const uint32_t *argb, uint32_t w, uint32_t h)
     return x ^ (x >> 32);
 }
 
+/* Alpha in 32 steps, position-dependent: a small rounding difference is not a difference. */
+static uint64_t alpha_hash(const uint32_t *argb, uint32_t w, uint32_t h)
+{
+    const uint64_t K = 0x9E3779B97F4A7C15ull;
+    uint64_t x = ((uint64_t)w << 32) | h, mul = K, step = K * 2;
+    size_t i, n = (size_t)w * h;
+    for (i = 0; i < n; i++, mul += step) x += (uint64_t)(argb[i] >> 27) * mul;
+    x ^= x >> 29;
+    x *= K;
+    return x ^ (x >> 32);
+}
+
 /* A .dds with a DX10 header, mips as stored: no decoding and no mip generation. 0: not usable. */
 static int pack_make_dds(const char *path, TexEnt *e)
 {
@@ -735,7 +751,7 @@ static int pack_make_dds(const char *path, TexEnt *e)
 
 /* Make e's texture from the pack image of this hash. 0: none, so the guest's own is used. */
 static int s_gen_mips;
-static int pack_make(uint64_t hash, TexEnt *e)
+static int pack_make(uint64_t hash, uint64_t alpha, TexEnt *e)
 {
     static IWICImagingFactory *fac;
     static int fac_tried;
@@ -753,6 +769,11 @@ static int pack_make(uint64_t hash, TexEnt *e)
         if (s_pack[m].hash < hash) lo = m + 1; else hi = m - 1;
     }
     if (found < 0) return 0;
+    if (s_pack[found].alpha != alpha) {
+        static unsigned nd;
+        if (nd++ < 40) fprintf(stderr, "[GPUBE] pack alpha differs, keeping the original: %s\n", s_pack[found].path);
+        return 0;
+    }
     {
         size_t len = strlen(s_pack[found].path);
         if (len > 4 && !_stricmp(s_pack[found].path + len - 4, ".dds")) {
@@ -844,7 +865,7 @@ decode:
         if (!nv2a_backend_decode_texture(t, argb)) { fprintf(stderr, "[GPUTR] decode FAILED fmt=%02X %ux%u\n", t->color, t->width, t->height); free(argb); e->tex = NULL; return s_white_srv; }
         q1 = qpc_us(); st_dec_us += q1 - q0;
         /* A slot rewritten this often is a sprite sheet, which no pack can hold: not worth hashing every version. */
-        if (s_hires && e->redecodes < 64 && mvc2_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), e)) { free(argb); goto made; }
+        if (s_hires && e->redecodes < 64 && mvc2_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), alpha_hash(argb, t->width, t->height), e)) { free(argb); goto made; }
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE;
