@@ -29,6 +29,7 @@ static unsigned long long gb_qf(void) { static LARGE_INTEGER f; if (!f.QuadPart)
 #include <stdint.h>
 #include "kernel/nv2a_backend.h"
 #include "mvc2_debug.h"
+#include "sprite_filter.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -45,7 +46,7 @@ typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used;
 typedef struct { uint32_t va, w, h;
                  ID3D11Texture2D *tex; ID3D11DepthStencilView *dsv; } Ds;
 typedef struct { uint32_t offset, w, h, color, pitch; uint64_t hash; uint32_t used;
-                 uint64_t thash, sig; uint32_t vframe, redecodes; /* texture-bytes hash, sample signature, s_frame+1 of the last full verify (get_tex fast path) */
+                 uint64_t thash, sig; uint32_t vframe, redecodes, from_pack; /* texture-bytes hash, sample signature, s_frame+1 of the last full verify (get_tex fast path) */
                  ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; } TexEnt;
 typedef struct { uint32_t key[12]; void *obj; } StateEnt;
 
@@ -371,6 +372,78 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
     s_ds[slot].va = zva; s_ds[slot].w = s->width; s_ds[slot].h = s->height;
     return &s_ds[slot];
+}
+
+/* ---- sprite layer ------------------------------------------------------------
+ * With the F1 sprite filter on, a run of character-sprite draws goes to its own transparent layer at 384x224, where one
+ * layer pixel is one sprite pixel and tiles have joined up into poses: the game stretches this art to 640x480, 5/3 across
+ * and 15/7 down, and at that size a filter only sees uneven blocks. Any other draw, a clear or a flip ends the run: the layer is filtered
+ * and laid over the picture. Depth is kept among the sprites only: the game draws them after the stage and over it. */
+static volatile int s_want_sf, s_want_smooth, s_want_sharpen;
+static int s_tex_from_pack;
+static int s_sf, s_smooth, s_sharpen, s_sf_dirty;
+static Rt *s_sf_rt;
+static ID3D11Texture2D *s_sf_tex, *s_sf_dtex;
+static ID3D11RenderTargetView *s_sf_rtv;
+static ID3D11ShaderResourceView *s_sf_srv;
+static ID3D11DepthStencilView *s_sf_dsv;
+static ID3D11BlendState *s_sf_blend;
+static uint32_t s_sf_w, s_sf_h;
+#define SF_W 384u
+#define SF_H 224u
+
+static int sf_layer_ready(uint32_t w, uint32_t h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    if (s_sf_tex && s_sf_w == w && s_sf_h == h) return 1;
+    SAFE_REL(s_sf_srv); SAFE_REL(s_sf_rtv); SAFE_REL(s_sf_tex); SAFE_REL(s_sf_dsv); SAFE_REL(s_sf_dtex);
+    if (!sprite_filter_init(s_dev, s_ctx)) return 0;
+    if (!s_sf_blend) {
+        D3D11_BLEND_DESC d;
+        memset(&d, 0, sizeof d);
+        d.RenderTarget[0].BlendEnable = TRUE;
+        d.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA; d.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        d.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; d.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        d.RenderTarget[0].BlendOp = d.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        d.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(ID3D11Device_CreateBlendState(s_dev, &d, &s_sf_blend))) return 0;
+    }
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_sf_tex))) return 0;
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_sf_tex, NULL, &s_sf_rtv);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_sf_tex, NULL, &s_sf_srv);
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_sf_dtex))) return 0;
+    ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_sf_dtex, NULL, &s_sf_dsv);
+    s_sf_w = w; s_sf_h = h;
+    return s_sf_rtv && s_sf_srv && s_sf_dsv;
+}
+
+/* Is this batch drawn at the sprite scale? A sheet also holds bar and effect parts drawn at other sizes, which would lose
+ * detail in the layer: they stay on the picture. */
+static int sf_at_sprite_scale(const Nv2aBatch *b)
+{
+    uint32_t i, j, n = b->count < 6 ? b->count : 6;
+    int seen = 0;
+    for (i = 0; i < n; i++)
+        for (j = i + 1; j < n; j++) {
+            float dx = fabsf(b->vertices[i].x - b->vertices[j].x), dy = fabsf(b->vertices[i].y - b->vertices[j].y);
+            float du = fabsf(b->vertices[i].u - b->vertices[j].u), dv = fabsf(b->vertices[i].v - b->vertices[j].v);
+            if (du > 1.0f && dx > 1.0f) { float r = dx / du; if (r < 1.60f || r > 1.73f) return 0; seen = 1; }
+            if (dv > 1.0f && dy > 1.0f) { float r = dy / dv; if (r < 2.07f || r > 2.21f) return 0; seen = 1; }
+        }
+    return seen;
+}
+
+/* End a run of sprites: filter the layer and lay it over the target it belongs to. */
+static void sf_flush(void)
+{
+    if (!s_sf_dirty) return;
+    s_sf_dirty = 0;
+    if (s_sf_rt && s_sf_rt->tex)
+        sprite_filter_run(s_sf_srv, s_sf_w, s_sf_h, s_sf_rt->rtv, s_sf_rt->w * (uint32_t)s_scale, s_sf_rt->h * (uint32_t)s_scale, s_sf, s_smooth, s_sharpen);
 }
 
 /* ---- state objects ------------------------------------------------------ */
@@ -865,7 +938,8 @@ decode:
         if (!nv2a_backend_decode_texture(t, argb)) { fprintf(stderr, "[GPUTR] decode FAILED fmt=%02X %ux%u\n", t->color, t->width, t->height); free(argb); e->tex = NULL; return s_white_srv; }
         q1 = qpc_us(); st_dec_us += q1 - q0;
         /* A slot rewritten this often is a sprite sheet, which no pack can hold: not worth hashing every version. */
-        if (s_hires && e->redecodes < 64 && mvc2_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), alpha_hash(argb, t->width, t->height), e)) { free(argb); goto made; }
+        if (s_hires && e->redecodes < 64 && mvc2_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), alpha_hash(argb, t->width, t->height), e)) { free(argb); e->from_pack = 1; goto made; }
+        e->from_pack = 0;
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE;
@@ -1035,6 +1109,7 @@ static DWORD WINAPI gb_watchdog(LPVOID p)
 
 static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags, uint32_t argb, uint32_t zst)
 {
+    sf_flush();
     Rt *rt;
     Ds *ds;
     if (!gb_ready()) return;
@@ -1125,6 +1200,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *dss;
     UINT stride = sizeof(Nv2aVertex), off = 0;
+    int layer_draw = 0;
 
     if (!gb_ready() || !b->count) return;
     if (s_fh < 0) s_fh = getenv("RECOMP_GPU_FRAMEHASH") != NULL;
@@ -1188,6 +1264,12 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     srv = s_white_srv;
     if (b->texture) {
         srv = get_tex(b->texture);
+        {
+            int ti;
+            s_tex_from_pack = 0;
+            for (ti = 0; s_sf && ti < MAX_TEX; ti++)
+                if (s_tx[ti].srv == srv) { s_tex_from_pack = (int)s_tx[ti].from_pack; break; }
+        }
         smp = get_sampler(b->texture);
         cb.textured = (srv != s_white_srv) ? 1 : 0; cb.pad = (s_noalpha ? 1u : 0u) | ((b->texture->use_mask & 1) ? 0u : 2u) | ((b->texture->use_mask & 2) ? 0u : 4u);
         cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
@@ -1211,7 +1293,33 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     bf[0] = ((r->blend_color >> 16) & 255) / 255.0f; bf[1] = ((r->blend_color >> 8) & 255) / 255.0f;
     bf[2] = (r->blend_color & 255) / 255.0f; bf[3] = ((r->blend_color >> 24) & 255) / 255.0f;
     rtv = rt->rtv;
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, ds ? ds->dsv : NULL);
+    {
+        /* Character sprites: the 128x128 sheets the game rewrites as it goes, alpha-blended onto a full-screen target. */
+        int sprite = s_sf && b->texture && b->texture->color == 0x0B && b->texture->width == 128 && b->texture->height == 128
+                     && r->blend_enable && r->blend_src == 0x302 && r->blend_dst == 0x303 && s->width >= 512
+                     && srv != s_white_srv && !s_tex_from_pack && sf_at_sprite_scale(b) && sf_layer_ready(SF_W, SF_H);
+        if (sprite) {
+            static const float none[4] = { 0, 0, 0, 0 };
+            if (!s_sf_dirty || s_sf_rt != rt) {
+                sf_flush();
+                ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_sf_rtv, none);
+                ID3D11DeviceContext_ClearDepthStencilView(s_ctx, s_sf_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+                s_sf_rt = rt;
+                s_sf_dirty = 1;
+            }
+            rtv = s_sf_rtv;
+            bs = s_sf_blend;
+            layer_draw = 1;
+            {   /* one sprite pixel to one layer pixel: no filtering on the way in */
+                Nv2aTexture nearest = *b->texture;
+                nearest.filter = (1u << 16) | (1u << 24);
+                smp = get_sampler(&nearest);
+            }
+        } else {
+            sf_flush();
+        }
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, layer_draw ? s_sf_dsv : (ds ? ds->dsv : NULL));
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
@@ -1220,8 +1328,9 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
      * the full-screen copy quad (0.5..640.5 onto texels 0..639) also only lands on texel centres with it (menu text measured
      * ~5% sharper). So the NV2A samples like D3D9 (centres on integers) for these pre-transformed draws. */
     { static float po = -1.0f; if (po < 0) { const char *e = getenv("RECOMP_GPU_PIXOFS"); po = e ? (float)atof(e) : 0.5f; if (po < 0) po = 0; }
-      vp.TopLeftX = vp.TopLeftY = po * (float)s_scale; }
-    vp.Width = (float)(s->width * (uint32_t)s_scale); vp.Height = (float)(s->height * (uint32_t)s_scale); vp.MinDepth = 0; vp.MaxDepth = 1;
+      if (layer_draw) { vp.TopLeftX = po * (float)SF_W / (float)s->width; vp.TopLeftY = po * (float)SF_H / (float)s->height; }
+      else vp.TopLeftX = vp.TopLeftY = po * (float)s_scale; }
+    vp.Width = layer_draw ? (float)SF_W : (float)(s->width * (uint32_t)s_scale); vp.Height = layer_draw ? (float)SF_H : (float)(s->height * (uint32_t)s_scale); vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_il);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1361,15 +1470,16 @@ static void publish_frame(void)
     gpu_present_frame_ready();
 }
 
-void mvc2_video_request(int scale, int hires)
+void mvc2_video_request(int scale, int hires, int sprite_filter, int smooth, int sharpen)
 {
-    s_want_scale = scale; s_want_hires = hires;
+    s_want_scale = scale; s_want_hires = hires; s_want_sf = sprite_filter; s_want_smooth = smooth; s_want_sharpen = sharpen;
 }
 
 /* Between frames, on the pushbuffer thread. */
 static void video_apply(void)
 {
     int scale = s_want_scale, hires = s_want_hires, i;
+    s_sf = s_want_sf; s_smooth = s_want_smooth; s_sharpen = s_want_sharpen;
     if (hires != s_hires) {                 /* every texture is looked up in the pack again */
         for (i = 0; i < MAX_TEX; i++) { DEFER_REL(s_tx[i].srv); DEFER_REL(s_tx[i].tex); s_tx[i].used = 0; }
         s_hires = hires;
@@ -1395,6 +1505,7 @@ static void gb_flip_impl(void)
     s_frame_for_grave = s_frame;
     texdump_poll();
     { unsigned long k = 0, keep = 0; for (; k < s_defer_n; k++) { if (s_grave[k].f + 2 <= s_frame) IUnknown_Release(s_grave[k].o); else s_grave[keep++] = s_grave[k]; } s_defer_n = keep; }
+    sf_flush();
     gb_mark(3);
     if (!s_rb_sync)
         for (i = 0; i < MAX_RT; i++)

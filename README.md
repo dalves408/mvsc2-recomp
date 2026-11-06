@@ -10,8 +10,9 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 
 ## Features
 
-- Direct3D 11 rendering, with render scale from 1x to 5x (640x480 to 3200x2400).
+- Direct3D 11 rendering, with three render scales: Original, Medium and High.
 - An upscaler (Lanczos resampling and contrast-adaptive sharpening) for when the picture is shown larger than it is drawn.
+- Sprite filters for the characters: xBR, OmniScale or ScaleFX, with optional smoothing and sharpening. Stages are left alone.
 - Support for a hi-res texture pack for stages and menus. No pack is included; put DDS or PNG files named by hashes of their colors and transparency in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
@@ -98,7 +99,7 @@ This builds the player version in `build_release`, with the C runtime linked in 
 ## Known issues
 
 - **Not fully tested:** a full Arcade run, two-player Versus, saves across sessions, memory units, and AMD or Intel GPUs on the current build.
-- **Slow PCs:** an i7-2860QM with a GTX 560M runs fights at about 58 FPS at 1x. Higher render scales may drop below 60, and the game then runs slower, because its speed is tied to its frame rate.
+- **Slow PCs:** an i7-2860QM with a GTX 560M runs fights at about 58 FPS at Original. Higher render scales may drop below 60, and the game then runs slower, because its speed is tied to its frame rate.
 - **Renderer gaps:** no register combiners, and texture stages 1-3 are missing.
 - **Crashes:** rare crashes and freezes stopped reproducing in repeated scripted runs after the threading fixes, but their exact cause was not proven.
 - **Windows N** may need the Media Feature Pack.
@@ -106,5 +107,6 @@ This builds the player version in `build_release`, with the C runtime linked in 
 ## Credits and legal
 
 - [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) provides the recompilation toolkit, under the MIT license. Its MCPX APU sources and `nv2a_regs.h` come from [xemu](https://github.com/xemu-project/xemu) and are under LGPL-2.1-or-later. Patches to those files stay under that license; see the toolkit's `NOTICE`.
+- The sprite filters are ports of OmniScale by Lior Halphon, ScaleFX by Sp00kyFox and xBR by Hyllian, from [libretro/slang-shaders](https://github.com/libretro/slang-shaders), each under MIT; their notices are in `src/sprite_filter.c`.
 - This project's own code is under the [MIT license](LICENSE). That license does not cover the game or anything generated from it.
 - Marvel vs. Capcom 2 is the property of Capcom and Marvel. This project is unofficial and is not affiliated with either company.

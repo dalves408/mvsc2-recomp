@@ -17,17 +17,24 @@ typedef struct {
     HWND combo;
 } Opt;
 
-static const char *const T_RES[] = { "1x  640x480 (Native)", "2x  1280x960", "3x  1920x1440", "4x  2560x1920", "5x  3200x2400" };
-static const int V_RES[] = { 1, 2, 3, 4, 5 };
+static const char *const T_RES[] = { "Original", "Medium", "High" };
+static const int V_RES[] = { 1, 2, 3 };
 static const char *const T_OFFON[] = { "Off", "On" };
 static const int V_OFFON[] = { 0, 1 };
 static const char *const T_STRETCH[] = { "Off (4:3)", "On (fills window)" };
+static const char *const T_SPRITE[] = { "Off", "xBR", "OmniScale", "ScaleFX" };
+static const int V_SPRITE[] = { 0, 1, 2, 3 };
+static const char *const T_LEVEL[] = { "Off", "Low", "High" };
+static const int V_LEVEL[] = { 0, 1, 2 };
 static const char *const T_WIN[] = { "1x  640x480", "2x  1280x960", "3x  1920x1440", "4x  2560x1920" };
 static const int V_WIN[] = { 1, 2, 3, 4 };
 
 static Opt s_opts[] = {
-    { "Render Scale", "resolution_scale", 5, T_RES, V_RES, 0 },
+    { "Render Scale", "resolution_scale", 3, T_RES, V_RES, 0 },
     { "Upscaling", "upscaling", 2, T_OFFON, V_OFFON, 0 },
+    { "Sprite filter", "sprite_filter", 4, T_SPRITE, V_SPRITE, 0 },
+    { "Smoothing", "sprite_smoothing", 3, T_LEVEL, V_LEVEL, 0 },
+    { "Sharpen", "sprite_sharpen", 3, T_LEVEL, V_LEVEL, 0 },
     { "Fullscreen", "fullscreen", 2, T_OFFON, V_OFFON, 1 },
     { "Window size", "window_scale", 4, T_WIN, V_WIN, 1 },
     { "Stretch image", "stretch", 2, T_STRETCH, V_OFFON, 0 },

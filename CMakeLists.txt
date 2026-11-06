@@ -64,6 +64,7 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/gpu_backend.c
     src/mvc2_overlay.c
+    src/sprite_filter.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

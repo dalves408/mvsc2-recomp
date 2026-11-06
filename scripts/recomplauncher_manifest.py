@@ -34,10 +34,15 @@ def manifest():
 
     toggle = [('Off', 0), ('On', 1)]
     settings = [
-        setting('scale', 'Render scale', 'display/resolution_scale', [(f'{n}x', n) for n in range(1, 6)], 1,
-                '1x is the original 640x480; higher draws the game sharper but needs a faster graphics card.'),
+        setting('scale', 'Render scale', 'display/resolution_scale', [('Original', 1), ('Medium', 2), ('High', 3)], 1,
+                'Original is the game as it was; Medium and High draw it sharper but need a faster graphics card.'),
         setting('upscaling', 'Upscaling', 'display/upscaling', toggle, 0,
                 'Sharper resampling and sharpening when the picture is shown larger than it is drawn.'),
+        setting('sprite-filter', 'Sprite filter', 'display/sprite_filter',
+                [('Off', 0), ('xBR', 1), ('OmniScale', 2), ('ScaleFX', 3)], 0,
+                'Smooths character sprites only. Works best at render scale Medium or High.'),
+        setting('sprite-smoothing', 'Sprite smoothing', 'display/sprite_smoothing', [('Off', 0), ('Low', 1), ('High', 2)], 0),
+        setting('sprite-sharpen', 'Sprite sharpen', 'display/sprite_sharpen', [('Off', 0), ('Low', 1), ('High', 2)], 0),
         setting('fullscreen', 'Fullscreen', 'display/fullscreen', toggle, 1,
                 'Big Picture mode always starts fullscreen.'),
         setting('window-size', 'Window size', 'display/window_scale',
