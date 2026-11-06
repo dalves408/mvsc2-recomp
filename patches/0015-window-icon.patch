@@ -1,0 +1,11 @@
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -488,6 +488,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+         wc.lpfnWndProc   = fb_wndproc;
+         wc.hInstance     = GetModuleHandleA(NULL);
+         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
++        wc.hIcon         = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));   /* the title's icon, if its exe has one */
+         wc.lpszClassName = "XboxRecompFramebuffer";
+         RegisterClassA(&wc);
+     }

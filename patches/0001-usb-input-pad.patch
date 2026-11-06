@@ -1,0 +1,1024 @@
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 5975014..ad78ca4 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -54,21 +54,278 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+ /* ======================================================================== */
+ 
+ #include <xinput.h>
++#include <stdio.h>
++#include <math.h>
+ #pragma comment(lib, "xinput.lib")
+ 
++/* ---- Controller layer (Xbox One / Series / 360 pads through XInput) ------
++ *
++ * Host XInput user n drives Xbox controller port n+1 (pad 0 = player 1, ...
++ * pad 3 = player 4), see usb_gamepad.c / ohci.c for the USB side.
++ *
++ * Face buttons are analog on the original Xbox (A B X Y, 0..255 pressure);
++ * XInput has them digital, so they read 0 or 255. LB/RB become Black/White
++ * and the analog triggers stay triggers. Defaults can be reshuffled with
++ *   RECOMP_PAD_MAP="lb=white,rb=black,lt=x"   (sources a b x y lb rb lt rt,
++ *                                              destinations a b x y black
++ *                                              white lt rt, or none)
++ * Other knobs:
++ *   RECOMP_PAD_DEADZONE=N        radial stick deadzone in raw units (0..32767);
++ *                                default 7849 left / 8689 right (XInput's
++ *                                own), 0 turns it off
++ *   RECOMP_PAD_TRIGGER_DZ=N      trigger values below N read 0 (default 30)
++ *   RECOMP_PAD_STICK_DPAD=0      do not mirror the left stick onto the D-pad
++ *                                (default on: fighting games and menus are
++ *                                happy with either)
++ *   RECOMP_PAD_DEBUG=1           log pad connect/disconnect and the report
++ *                                bytes sent to the game (usb_gamepad.c)
++ *   RECOMP_PAD_FAKE="n:from-to,..."  pretend pad n is connected (idle) between
++ *                                two times in ms (test aid, no hardware)
++ *   RECOMP_PAD_SELFTEST=1        run the mapper on synthetic XInput states and
++ *                                log PASS/FAIL (xbox_InputSelfTest)
++ */
+ static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+ 
++static int    s_cfg_done;
++static int    s_dz_left = 7849, s_dz_right = 8689, s_trig_dz = 30;
++static int    s_stick_dpad = 1;
++static int    s_debug;
++static signed char s_map[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };  /* a b x y lb rb lt rt -> dest */
++
++typedef struct { int port; DWORD from, to; } FakeWin;
++static FakeWin s_fake[8];
++static int     s_nfake;
++
++/* Injected states for the self-test. */
++static XINPUT_STATE s_inject[XBOX_MAX_CONTROLLERS];
++static int          s_inject_on[XBOX_MAX_CONTROLLERS];
++
++static int dest_by_name(const char *p, size_t n)
++{
++    static const char *names[] = { "a", "b", "x", "y", "black", "white", "lt", "rt" };
++    int i;
++    for (i = 0; i < 8; i++)
++        if (strlen(names[i]) == n && _strnicmp(p, names[i], n) == 0)
++            return i;
++    if (n == 4 && _strnicmp(p, "none", 4) == 0)
++        return -1;
++    return -2;
++}
++
++static int src_by_name(const char *p, size_t n)
++{
++    static const char *names[] = { "a", "b", "x", "y", "lb", "rb", "lt", "rt" };
++    int i;
++    for (i = 0; i < 8; i++)
++        if (strlen(names[i]) == n && _strnicmp(p, names[i], n) == 0)
++            return i;
++    return -1;
++}
++
++static void cfg_load(void)
++{
++    const char *e;
++    if (s_cfg_done)
++        return;
++    s_cfg_done = 1;
++    if ((e = getenv("RECOMP_PAD_DEADZONE")) && *e) {
++        s_dz_left = s_dz_right = atoi(e);
++        if (s_dz_left < 0) s_dz_left = s_dz_right = 0;
++        if (s_dz_left > 30000) s_dz_left = s_dz_right = 30000;
++    }
++    if ((e = getenv("RECOMP_PAD_TRIGGER_DZ")) && *e)
++        s_trig_dz = atoi(e);
++    if ((e = getenv("RECOMP_PAD_STICK_DPAD")) && *e)
++        s_stick_dpad = atoi(e) != 0;
++    s_debug = (e = getenv("RECOMP_PAD_DEBUG")) && *e && *e != '0';
++    if ((e = getenv("RECOMP_PAD_MAP")) && *e) {
++        while (*e) {
++            const char *eq, *end;
++            int s, d;
++            while (*e == ' ' || *e == ',') e++;
++            if (!*e) break;
++            eq = strchr(e, '=');
++            end = e;
++            while (*end && *end != ',') end++;
++            if (eq && eq < end) {
++                s = src_by_name(e, (size_t)(eq - e));
++                d = dest_by_name(eq + 1, (size_t)(end - eq - 1));
++                if (s >= 0 && d >= -1)
++                    s_map[s] = (signed char)d;
++                else
++                    fprintf(stderr, "  [PAD] bad RECOMP_PAD_MAP entry ignored\n");
++            }
++            e = end;
++        }
++    }
++    if ((e = getenv("RECOMP_PAD_FAKE")) && *e) {
++        while (*e && s_nfake < 8) {
++            int port = atoi(e);
++            const char *c = strchr(e, ':');
++            const char *dash = c ? strchr(c, '-') : NULL;
++            const char *end = strchr(e, ',');
++            FakeWin *f = &s_fake[s_nfake];
++            if (!c) break;
++            f->port = port;
++            f->from = (DWORD)atol(c + 1);
++            f->to = (dash && (!end || dash < end) && dash[1] >= '0' && dash[1] <= '9')
++                        ? (DWORD)atol(dash + 1) : 0xFFFFFFFFu;
++            if (port >= 0 && port < XBOX_MAX_CONTROLLERS)
++                s_nfake++;
++            if (!end) break;
++            e = end + 1;
++        }
++    }
++    if (s_debug)
++        fprintf(stderr, "  [PAD] config: deadzone L=%d R=%d trigger=%d stick->dpad=%d "
++                "map(a b x y lb rb lt rt)=%d %d %d %d %d %d %d %d fake=%d\n",
++                s_dz_left, s_dz_right, s_trig_dz, s_stick_dpad,
++                s_map[0], s_map[1], s_map[2], s_map[3], s_map[4], s_map[5],
++                s_map[6], s_map[7], s_nfake);
++}
++
++/* Radial deadzone with rescale, so the stick still reaches full range. */
++static void stick_deadzone(SHORT *px, SHORT *py, int dz)
++{
++    double x = *px, y = *py, m = sqrt(x * x + y * y), k, nx, ny;
++    if (dz <= 0 || m == 0.0)
++        return;
++    if (m <= dz) {
++        *px = *py = 0;
++        return;
++    }
++    k = (m - dz) / (32767.0 - dz);
++    if (k > 1.0) k = 1.0;
++    nx = x / m * k * 32767.0;
++    ny = y / m * k * 32767.0;
++    if (nx > 32767.0) nx = 32767.0;
++    if (nx < -32767.0) nx = -32767.0;
++    if (ny > 32767.0) ny = 32767.0;
++    if (ny < -32767.0) ny = -32767.0;
++    *px = (SHORT)nx;
++    *py = (SHORT)ny;
++}
++
++/* One XInput state -> one Xbox pad state (no keyboard). */
++static void map_xinput(const XINPUT_STATE *xi, XBOX_INPUT_STATE *out)
++{
++    const XINPUT_GAMEPAD *g = &xi->Gamepad;
++    unsigned src[8];
++    int i;
++
++    memset(out, 0, sizeof *out);
++    out->dwPacketNumber = xi->dwPacketNumber;
++    out->Gamepad.wButtons = g->wButtons & 0x00FF;   /* dpad, start, back, thumbs: same bits */
++
++    src[0] = (g->wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
++    src[1] = (g->wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
++    src[2] = (g->wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
++    src[3] = (g->wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
++    src[4] = (g->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
++    src[5] = (g->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
++    src[6] = g->bLeftTrigger  >= s_trig_dz ? g->bLeftTrigger  : 0;
++    src[7] = g->bRightTrigger >= s_trig_dz ? g->bRightTrigger : 0;
++    for (i = 0; i < 8; i++) {
++        int d = s_map[i];
++        if (d >= 0 && src[i] > out->Gamepad.bAnalogButtons[d])
++            out->Gamepad.bAnalogButtons[d] = (BYTE)src[i];
++    }
++
++    out->Gamepad.sThumbLX = g->sThumbLX;
++    out->Gamepad.sThumbLY = g->sThumbLY;
++    out->Gamepad.sThumbRX = g->sThumbRX;
++    out->Gamepad.sThumbRY = g->sThumbRY;
++    stick_deadzone(&out->Gamepad.sThumbLX, &out->Gamepad.sThumbLY, s_dz_left);
++    stick_deadzone(&out->Gamepad.sThumbRX, &out->Gamepad.sThumbRY, s_dz_right);
++
++    if (s_stick_dpad) {
++        if (out->Gamepad.sThumbLY >  16384) out->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_UP;
++        if (out->Gamepad.sThumbLY < -16384) out->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_DOWN;
++        if (out->Gamepad.sThumbLX < -16384) out->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_LEFT;
++        if (out->Gamepad.sThumbLX >  16384) out->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_RIGHT;
++    }
++}
++
++/* Is a fake (test) pad window open for this port? */
++static int fake_active(DWORD port)
++{
++    static DWORD t0;
++    DWORD now = GetTickCount(), t;
++    int i;
++    if (!s_nfake)
++        return 0;
++    if (!t0)
++        t0 = now ? now : 1;
++    t = now - t0;
++    for (i = 0; i < s_nfake; i++)
++        if ((DWORD)s_fake[i].port == port && t >= s_fake[i].from && t < s_fake[i].to)
++            return 1;
++    return 0;
++}
++
++/* XInputGetState on an empty slot is slow on some systems, and a hot-plugged
++ * pad does not need millisecond latency to be noticed: an absent slot is
++ * probed once a second, a present one on every call. */
++static DWORD pad_query(DWORD port, XINPUT_STATE *st)
++{
++    static DWORD last_probe[XBOX_MAX_CONTROLLERS];
++    static unsigned char probed[XBOX_MAX_CONTROLLERS];
++    DWORD now = GetTickCount(), rc;
++
++    cfg_load();
++    if (s_inject_on[port]) {
++        *st = s_inject[port];
++        return ERROR_SUCCESS;
++    }
++    if (fake_active(port)) {
++        memset(st, 0, sizeof *st);
++        st->dwPacketNumber = ++g_last_packet[port];
++        if (!g_controller_connected[port]) {
++            g_controller_connected[port] = TRUE;
++            fprintf(stderr, "  [PAD] host pad %lu connected (simulated)\n", (unsigned long)port);
++        }
++        return ERROR_SUCCESS;
++    }
++    if (!g_controller_connected[port] && probed[port] && now - last_probe[port] < 1000)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    rc = XInputGetState(port, st);
++    if (rc == ERROR_SUCCESS) {
++        if (!g_controller_connected[port]) {
++            XINPUT_CAPABILITIES caps;
++            g_controller_connected[port] = TRUE;
++            if (XInputGetCapabilities(port, 0, &caps) == ERROR_SUCCESS)
++                fprintf(stderr, "  [PAD] host pad %lu connected: XInput type %u subtype %u "
++                        "(-> Xbox controller port %lu)\n", (unsigned long)port,
++                        caps.Type, caps.SubType, (unsigned long)port + 1);
++            else
++                fprintf(stderr, "  [PAD] host pad %lu connected (-> Xbox controller port %lu)\n",
++                        (unsigned long)port, (unsigned long)port + 1);
++        }
++    } else {
++        if (g_controller_connected[port])
++            fprintf(stderr, "  [PAD] host pad %lu disconnected\n", (unsigned long)port);
++        g_controller_connected[port] = FALSE;
++        last_probe[port] = now;
++        probed[port] = 1;
++    }
++    return rc;
++}
++
++BOOL xbox_InputPadPresent(DWORD dwPort)
++{
++    XINPUT_STATE st;
++    if (dwPort >= XBOX_MAX_CONTROLLERS)
++        return FALSE;
++    return pad_query(dwPort, &st) == ERROR_SUCCESS;
++}
++
+ /* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
+  * with the SDL backend; the GDI window in fb_present.c records the keys. */
+ 
+ void xbox_InputInit(void)
+ {
+-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+-        XINPUT_STATE state;
+-        DWORD result = XInputGetState(i, &state);
+-        g_controller_connected[i] = (result == ERROR_SUCCESS);
+-    }
++    cfg_load();
+ }
+ 
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -79,9 +336,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
+ 
+-    result = XInputGetState(dwPort, &xi_state);
++    result = pad_query(dwPort, &xi_state);
+     if (result != ERROR_SUCCESS) {
+-        g_controller_connected[dwPort] = FALSE;
+         if (dwPort == 0) {
+             /* Keyboard and mouse stand in for an absent pad, so the game is
+              * playable with no controller plugged in. */
+@@ -96,32 +352,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+         return result;
+     }
+ 
+-    g_controller_connected[dwPort] = TRUE;
+-    g_last_packet[dwPort] = xi_state.dwPacketNumber;
+-
+-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+-    pState->dwPacketNumber = xi_state.dwPacketNumber;
+-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
+-
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+-
+-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
+-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
+-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
+-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
++    map_xinput(&xi_state, pState);
+ 
+     if (dwPort == 0)
+         keyboard_merge(pState);
+@@ -140,6 +371,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+ 
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+         return ERROR_DEVICE_NOT_CONNECTED;
++    if (!g_controller_connected[dwPort])
++        return ERROR_DEVICE_NOT_CONNECTED;
+ 
+     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
+     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
+@@ -170,6 +403,130 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+     return ERROR_SUCCESS;
+ }
+ 
++/* ---- Self-test: synthetic XInput states through the real path ------------
++ * Drives usb_gamepad_report(), so what is checked is the 20-byte report the
++ * game's USB stack would read, not just the mapper. */
++extern int usb_gamepad_report(int pad, uint8_t *out, int max);
++
++static int st_check(const char *name, int pad, const uint8_t *want, const uint8_t *got)
++{
++    int i, ok = memcmp(want, got, 20) == 0;
++    fprintf(stderr, "  [PADTEST] %-28s pad %d %s  report=", name, pad, ok ? "PASS" : "FAIL");
++    for (i = 0; i < 20; i++)
++        fprintf(stderr, "%02X%s", got[i], i == 3 || i == 11 ? "|" : " ");
++    if (!ok) {
++        fprintf(stderr, " expected=");
++        for (i = 0; i < 20; i++)
++            fprintf(stderr, "%02X ", want[i]);
++    }
++    fputc('\n', stderr);
++    return ok;
++}
++
++int xbox_InputSelfTest(void)
++{
++    int fails = 0, saved_dz_l, saved_dz_r, saved_sd, saved_kbd_dummy = 0, p;
++    uint8_t got[20], want[20];
++    XINPUT_STATE x;
++    signed char saved_map[8];
++
++    (void)saved_kbd_dummy;
++    cfg_load();
++    saved_dz_l = s_dz_left; saved_dz_r = s_dz_right; saved_sd = s_stick_dpad;
++    memcpy(saved_map, s_map, sizeof saved_map);
++    { static const signed char dflt[8] = { 0, 1, 2, 3, 4, 5, 6, 7 }; memcpy(s_map, dflt, 8); }
++    s_dz_left = s_dz_right = 0; s_stick_dpad = 0;
++    fprintf(stderr, "  [PADTEST] begin (default layout, deadzone off, stick->dpad off)\n");
++
++    /* 1: face buttons -> analog A B X Y, shoulders -> Black/White */
++    memset(&x, 0, sizeof x); x.dwPacketNumber = 1;
++    x.Gamepad.wButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_Y |
++                         XINPUT_GAMEPAD_LEFT_SHOULDER;
++    memset(want, 0, 20); want[1] = 20;
++    want[4] = 255; want[7] = 255; want[8] = 255;     /* A, Y, Black */
++    s_inject[0] = x; s_inject_on[0] = 1;
++    usb_gamepad_report(0, got, 20);
++    fails += !st_check("A+Y+LB -> A,Y,Black", 0, want, got);
++
++    /* 2: digital group: dpad, start, back, thumb clicks; RB -> White; B, X */
++    x.Gamepad.wButtons = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT |
++                         XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK |
++                         XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB |
++                         XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_B |
++                         XINPUT_GAMEPAD_X;
++    memset(want, 0, 20); want[1] = 20;
++    want[2] = 0x01 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80;
++    want[5] = 255; want[6] = 255; want[9] = 255;     /* B, X, White */
++    s_inject[0] = x;
++    usb_gamepad_report(0, got, 20);
++    fails += !st_check("dpad/start/back/clicks/B/X/RB", 0, want, got);
++
++    /* 3: triggers and sticks, exact pass-through with deadzone off */
++    memset(&x, 0, sizeof x); x.dwPacketNumber = 3;
++    x.Gamepad.bLeftTrigger = 200; x.Gamepad.bRightTrigger = 77;
++    x.Gamepad.sThumbLX = 20000; x.Gamepad.sThumbLY = -10000;
++    x.Gamepad.sThumbRX = -32768 + 1; x.Gamepad.sThumbRY = 1234;
++    memset(want, 0, 20); want[1] = 20;
++    want[10] = 200; want[11] = 77;
++    want[12] = 20000 & 255; want[13] = 20000 >> 8;
++    want[14] = (uint8_t)(-10000 & 255); want[15] = (uint8_t)((-10000 >> 8) & 255);
++    want[16] = (uint8_t)((-32767) & 255); want[17] = (uint8_t)(((-32767) >> 8) & 255);
++    want[18] = 1234 & 255; want[19] = 1234 >> 8;
++    s_inject[0] = x;
++    usb_gamepad_report(0, got, 20);
++    fails += !st_check("triggers + sticks exact", 0, want, got);
++
++    /* 4: deadzone on: small deflection -> 0, full stays full; stick->dpad */
++    s_dz_left = 7849; s_dz_right = 8689; s_stick_dpad = 1;
++    memset(&x, 0, sizeof x); x.dwPacketNumber = 4;
++    x.Gamepad.sThumbLX = 5000; x.Gamepad.sThumbLY = 5000;     /* inside */
++    x.Gamepad.sThumbRX = 32767;                               /* full */
++    x.Gamepad.bLeftTrigger = 20;                              /* under 30 */
++    memset(want, 0, 20); want[1] = 20;
++    want[16] = 0xFF; want[17] = 0x7F;
++    s_inject[0] = x;
++    usb_gamepad_report(0, got, 20);
++    fails += !st_check("deadzone small->0, full->full", 0, want, got);
++
++    memset(&x, 0, sizeof x); x.dwPacketNumber = 5;
++    x.Gamepad.sThumbLX = -32767;                              /* full left */
++    memset(want, 0, 20); want[1] = 20;
++    want[2] = 0x04;                                           /* stick -> dpad left */
++    want[12] = 0x01; want[13] = 0x80;                         /* -32767 */
++    s_inject[0] = x;
++    usb_gamepad_report(0, got, 20);
++    fails += !st_check("stick left -> dpad + axis", 0, want, got);
++
++    /* 5: remap lb<->rb and 4 players: each pad reports only its own state */
++    s_dz_left = s_dz_right = 0; s_stick_dpad = 0;
++    s_inject_on[0] = 0;
++    for (p = 0; p < 4; p++) {
++        memset(&x, 0, sizeof x); x.dwPacketNumber = 10 + p;
++        x.Gamepad.wButtons = (WORD)(p == 0 ? XINPUT_GAMEPAD_A : p == 1 ? XINPUT_GAMEPAD_B :
++                                    p == 2 ? XINPUT_GAMEPAD_X : XINPUT_GAMEPAD_Y);
++        s_inject[p] = x; s_inject_on[p] = 1;
++    }
++    for (p = 0; p < 4; p++) {
++        memset(want, 0, 20); want[1] = 20; want[4 + p] = 255;
++        usb_gamepad_report(p, got, 20);
++        fails += !st_check("4 pads, own buttons only", p, want, got);
++    }
++    s_map[4] = 5; s_map[5] = 4;                               /* swap LB/RB */
++    memset(&x, 0, sizeof x); x.dwPacketNumber = 20;
++    x.Gamepad.wButtons = XINPUT_GAMEPAD_LEFT_SHOULDER;
++    s_inject[1] = x;
++    memset(want, 0, 20); want[1] = 20; want[9] = 255;         /* LB -> White */
++    usb_gamepad_report(1, got, 20);
++    fails += !st_check("remap LB=white", 1, want, got);
++
++    for (p = 0; p < 4; p++) s_inject_on[p] = 0;
++    s_dz_left = saved_dz_l; s_dz_right = saved_dz_r; s_stick_dpad = saved_sd;
++    memcpy(s_map, saved_map, sizeof saved_map);
++    fprintf(stderr, "  [PADTEST] done: %s (%d failing)\n", fails ? "FAIL" : "ALL PASS", fails);
++    fflush(stderr);
++    return fails;
++}
++
+ /* ======================================================================== */
+ #else /* !_WIN32 */
+ /* ====================  SDL2 GameController backend  ===================== */
+@@ -305,6 +662,13 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+     return ERROR_SUCCESS;
+ }
+ 
++BOOL xbox_InputPadPresent(DWORD dwPort)
++{
++    return dwPort < XBOX_MAX_CONTROLLERS && g_pads[dwPort] != NULL;
++}
++
++int xbox_InputSelfTest(void) { return 0; }
++
+ BOOL xbox_InputIsConnected(DWORD dwPort)
+ {
+     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+diff --git a/src/input/xinput_xbox.h b/src/input/xinput_xbox.h
+index 4779275..4d4c226 100644
+--- a/src/input/xinput_xbox.h
++++ b/src/input/xinput_xbox.h
+@@ -104,6 +104,15 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
+  */
+ BOOL xbox_InputIsConnected(DWORD dwPort);
+ 
++/**
++ * Is a host controller present for this port (not counting the keyboard)?
++ * Absent slots are probed at most once a second, so this is cheap to poll.
++ */
++BOOL xbox_InputPadPresent(DWORD dwPort);
++
++/** Run the mapper on synthetic states and log PASS/FAIL ([PADTEST]). Returns failures. */
++int xbox_InputSelfTest(void);
++
+ /**
+  * Get controller capabilities.
+  */
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index efa5046..a4926fa 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -182,6 +182,7 @@ static int s_device_hc;
+  * 1-4). Which slot XAPI gives a pad is decided by its port: see OHCI_PORTS. */
+ static unsigned s_ndp = OHCI_PORTS;
+ static int s_npads = 1;          /* RECOMP_USB_PADS */
++static int s_auto_pads = 1;      /* RECOMP_USB_PADS unset: pads 2-4 follow the host controllers (hot-plug) */
+ static int s_enabled;
+ static int s_trace;
+ 
+@@ -432,7 +433,7 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
+ #define g_ctrl_sent g_ctrl_sent_[pad]
+ 
+ /* Pads plugged in so far, in port order. */
+-static int s_plugged_pads;
++static int s_pad_plugged[USB_GAMEPAD_MAX];
+ 
+ /* Which pad an endpoint descriptor talks to: by its function address, and
+  * address 0 -- the default address a device answers before SET_ADDRESS --
+@@ -443,8 +444,8 @@ static int ohci_pad_for(uint32_t ed0)
+ {
+     uint32_t fa = ed0 & 0x7Fu;
+     int d;
+-    for (d = 0; d < s_plugged_pads; d++)
+-        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
++    for (d = 0; d < USB_GAMEPAD_MAX; d++)
++        if (s_pad_plugged[d] && (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0))
+             return d;
+     return -1;
+ }
+@@ -511,6 +512,20 @@ static int guest_ok(uint32_t va, uint32_t bytes)
+  * again, forever. */
+ static uint32_t bus_resolve(uint32_t addr)
+ {
++    /* An address that numerically falls inside the image but is inside a live
++     * contiguous allocation is the allocation (MvC2: the XPP pool and HCCA sit
++     * at 0x80560000.. while the image runs to 0x696340). */
++    {
++        extern uint32_t xbox_ContiguousBlockSize(uint32_t);
++        extern const volatile uint8_t *xbox_PhysRamNameMap(void);
++        /* A heap page the driver named through MmGetPhysicalAddress is RAM,
++         * even if the same number is also inside a window allocation. */
++        if (addr && addr < OHCI_CONTIG_SIZE && xbox_PhysRamNameMap()[addr >> 12])
++            return addr;
++        if (addr && addr < OHCI_CONTIG_SIZE
++                && xbox_ContiguousBlockSize(OHCI_CONTIG_BASE + addr) != 0)
++            return OHCI_CONTIG_BASE + addr;
++    }
+     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+         return addr;
+     if (addr && addr < xbox_ContiguousAllocatedBytes())
+@@ -701,6 +716,29 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
+     return TD_CC_NOERROR;
+ }
+ 
++/* Crash forensics: the last controller events (the XPP done-queue handler
++ * faults on a bad TD about one startup in eight; this says what the walker
++ * and the ISR delivery did just before). */
++typedef struct { unsigned tick; unsigned kind; unsigned a, b, c, d, e, f; } OhciEv;
++static OhciEv s_ev[64];
++static volatile LONG s_ev_n;
++static void ohci_ev(unsigned kind, unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned f)
++{
++    OhciEv *v = &s_ev[(unsigned)InterlockedIncrement(&s_ev_n) & 63u];
++    v->tick = GetTickCount(); v->kind = kind; v->a = a; v->b = b; v->c = c; v->d = d; v->e = e; v->f = f;
++}
++void ohci_dump_events(void)
++{
++    unsigned n = (unsigned)s_ev_n, i;
++    fprintf(stderr, "  [OHCIEV] last events (tid-less), oldest first:\n");
++    for (i = 0; i < 64; i++) {
++        OhciEv *v = &s_ev[(n + 1 + i) & 63u];
++        if (!v->tick) continue;
++        fprintf(stderr, "  [OHCIEV] t=%u k=%u %08X %08X %08X %08X %08X %08X\n",
++                v->tick, v->kind, v->a, v->b, v->c, v->d, v->e, v->f);
++    }
++    fflush(stderr);
++}
+ /* Walk the control list once. Returns 1 if anything completed. */
+ /* Walk one list of endpoint descriptors, moving whatever is queued on each.
+  *
+@@ -730,11 +768,60 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
+         if (ed0 & ED_SKIP) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
+         if (head & ED_HEAD_HALT) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
+ 
++        /* The guest driver runs beside this walk (a DPC on the timer thread,
++         * a thread cancelling a transfer) and edits the ED while it is
++         * parked: it re-points HeadP past TDs it is cancelling, then frees
++         * them. The controller writes HeadP with a compare-and-swap on what
++         * it read, as the hardware does on every retirement, so a guest edit
++         * always wins; a stale write-back used to leave HeadP pointing at a
++         * freed TD whose link was -1, and the done-queue handler faulted at
++         * 0x7FFFFFF8 (about one startup in eight). */
++        volatile LONG *hp = (volatile LONG *)guest_ptr(ed + 8, 4u);
++
+         while ((head & ED_PTR_MASK) != tail
+             && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
+             uint32_t td = head & ED_PTR_MASK;
+             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
+-            uint32_t cc = ohci_do_td(hc, ed0, td);
++            uint32_t cc, nh;
++
++            if (rd32(ed) & ED_SKIP)
++                break;
++            if (next && !guest_ok(next, 16)) {
++                static int nbad;
++                if (nbad++ < 8) {
++                    fprintf(stderr, "  [OHCI%d] BAD link: ED %08X head %08X td %08X next %08X\n",
++                            hc->index, ed, head, td, next);
++                    fflush(stderr);
++                }
++                break;
++            }
++            ohci_ev(1, ed, head, tail, td, next, rd32(td));
++            cc = ohci_do_td(hc, ed0, td);
++            ohci_ev(2, td, cc, *done_head, rd32(td + 8), rd32(td + 0x14), 0);
++
++            /* Commit the retirement with the HeadP compare-and-swap FIRST. If
++             * the driver got there before us (it cancelled the request and
++             * re-pointed HeadP), the TD is the driver's: do not touch it and
++             * do not put it on the done queue. Retiring it anyway left a TD the
++             * driver had already freed on the done chain (double free /
++             * flush on a freed TD). */
++            nh = next | (head & ED_HEAD_TOGGLE);
++            if (cc != TD_CC_NOERROR)
++                nh |= ED_HEAD_HALT;         /* a stall halts the endpoint */
++            if (hp) {
++                if ((uint32_t)InterlockedCompareExchange(hp, (LONG)nh, (LONG)head) != head) {
++                    static int nrace;
++                    if (nrace++ < 8) {
++                        fprintf(stderr, "  [OHCI%d] ED %08X HeadP changed under the walk "
++                                "(%08X -> %08X); the driver's edit stands, TD %08X not retired\n",
++                                hc->index, ed, head, (unsigned)*hp, td);
++                        fflush(stderr);
++                    }
++                    break;
++                }
++            } else {
++                wr32(ed + 8, nh);
++            }
+ 
+             /* Report the outcome where the driver reads it, then put the
+              * descriptor on the done queue, newest first. */
+@@ -742,28 +829,27 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
+             wr32(td + 8, *done_head);
+             *done_head = td;
+             completed++;
+-
+-            head = next | (head & ED_HEAD_TOGGLE);
+-            if (cc != TD_CC_NOERROR) {
+-                head |= ED_HEAD_HALT;       /* a stall halts the endpoint */
++            head = nh;
++            if (cc != TD_CC_NOERROR)
+                 break;
+-            }
+-        }
+-        wr32(ed + 8, head);
+-        ed = rd32(ed + 12) & ED_PTR_MASK;
++        }        ed = rd32(ed + 12) & ED_PTR_MASK;
+     }
+ 
+     return completed;
+ }
+ 
+ /* Publish the done queue where the driver reads it and say so. */
++/* When a done queue was last published; read by the optional mvc2_done_hook probe (patch_gen.ps1 -Hoplat). */
++volatile ULONGLONG g_ohci_pub_tick;
+ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+ {
+     uint32_t hcca = hc->reg[HcHCCA / 4];
+ 
+     if (hcca)
+         wr32(hcca + HCCA_DONE_HEAD, done_head);
++    g_ohci_pub_tick = GetTickCount64();
+     hc->reg[HcDoneHead / 4] = done_head;
++    ohci_ev(3, hc->index, done_head, hcca, 0, 0, 0);
+     hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+ }
+ 
+@@ -938,7 +1024,9 @@ static int ohci_call_isr(OhciController *hc)
+     }
+     g_esp = XBOX_WORKER_STACK_TOP(slot);
+     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
++    ohci_ev(4, hc->index, slot, hc->reg[HcDoneHead / 4], hc->reg[HcInterruptStatus / 4], 0, 0);
+     claimed = ohci_isr_call(hc->index);
++    ohci_ev(5, hc->index, slot, claimed, 0, 0, 0);
+     xbox_worker_stack_free(slot);
+     return claimed;
+ }
+@@ -1047,6 +1135,28 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
+  * the interrupt it has been waiting for. Repeat delivery and the transfer
+  * lists come after that answer, not before it.
+  */
++/* One controller tick. Sleep(4) is only as exact as the system timer, and on
++ * Windows 11 a process's timeBeginPeriod(1) is not honoured when it is not the
++ * foreground or its window is hidden: Sleep(4) then takes 15.6 ms (measured: pass gaps of
++ * 16/32/47/63 ms). A high-resolution waitable timer keeps the 4 ms cadence. */
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++static void hc_sleep_tick(HANDLE *pt)
++{
++    if (!*pt) {
++        *pt = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++        if (!*pt) *pt = INVALID_HANDLE_VALUE;
++    }
++    if (*pt != INVALID_HANDLE_VALUE) {
++        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)OHCI_TICK_MS * 10000;
++        if (SetWaitableTimer(*pt, &due, 0, NULL, NULL, FALSE)) {
++            WaitForSingleObject(*pt, 100);
++            return;
++        }
++    }
++    Sleep(OHCI_TICK_MS);
++}
+ static DWORD WINAPI ohci_thread(LPVOID unused)
+ {
+     /* This thread calls recompiled code, so it needs what any thread running
+@@ -1058,6 +1168,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+      * what killed the process here, two interrupts in, with no fault report
+      * because the fault was in the runtime rather than in the title. */
+     unsigned waited = 0;
++    /* The guest USB driver goes operational ~20 s after launch on a fast PC and
++     * ~31 s on a slow one; the old fixed 30 s gave up before it on slow PCs, so
++     * no pad ever attached. Measured on the wall clock (the
++     * tick is OHCI_TICK_MS, whose real length depends on the timer resolution). */
++    ULONGLONG wait_limit_ms = 180000ull, wait_t0 = GetTickCount64();
++    { const char *e = getenv("RECOMP_USB_WAIT_S"); if (e && atoi(e) > 0) wait_limit_ms = (ULONGLONG)atoi(e) * 1000ull; }
+     int plugged = 0;
+     uint32_t last_status = 0;
+     unsigned repeats = 0;
+@@ -1065,8 +1181,13 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+     int      held_off_warned = 0, held_off_forced = 0, gated = 0;
+     unsigned last_ack = 0;
+     unsigned first_port = 0, settle = 0;
++    HANDLE hc_timer = NULL; ULONGLONG fm_last_ms = GetTickCount64(); int hc_wall = !getenv("RECOMP_HC_FIXED_TICK");
++    /* RECOMP_HC_STAT=1: once a second, one line of controller-thread timing (pass count, longest gap between passes, passes over 30 ms, longest sleep and longest pass body). */
++    int g_hcstat = getenv("RECOMP_HC_STAT") != NULL; ULONGLONG st_last = GetTickCount64(), st_print = st_last; LONGLONG qa = 0, qb = 0, qfreq; unsigned st_workmax = 0, st_sleepmax = 0, st_homax = 0; { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qfreq = f.QuadPart; } unsigned st_n = 0, st_maxgap = 0, st_slow = 0, st_wdh = 0, st_ho = 0;
+ 
+     (void)unused;
++    /* The controller has to keep its frame cadence when the PC is busy: the guest times its USB requests in wall-clock milliseconds, and a controller thread starved for ~100 ms makes a pad request time out and be cancelled (observed under load only, 0 of 1 solo, every run with 16 instances), which then races the guest's cancel path. */
++    { const char *p = getenv("RECOMP_HC_PRIO"); int pr = (p && *p) ? atoi(p) : 2; SetThreadPriority(GetCurrentThread(), pr); }
+     {
+         uint32_t tib = xbox_AllocThreadTib();
+         if (!tib) {
+@@ -1083,14 +1204,17 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+         uint32_t control, enable, status;
+         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+ 
+-        Sleep(OHCI_TICK_MS);
++        if (g_hcstat) { LARGE_INTEGER _q; QueryPerformanceCounter(&_q); if (qa) { LONGLONG w = (_q.QuadPart - qa) * 1000 / qfreq; if (w > st_workmax) st_workmax = (unsigned)w; } qb = _q.QuadPart; }
++        hc_sleep_tick(&hc_timer);
++        if (g_hcstat) { LARGE_INTEGER _q; QueryPerformanceCounter(&_q); LONGLONG s = (_q.QuadPart - qb) * 1000 / qfreq; if (s > st_sleepmax) st_sleepmax = (unsigned)s; qa = _q.QuadPart; }
++        if (g_hcstat) { ULONGLONG nw = GetTickCount64(); unsigned gap = (unsigned)(nw - st_last); st_last = nw; st_n++; if (gap > st_maxgap) st_maxgap = gap; if (gap > 30) st_slow++; if (nw - st_print >= 1000) { st_print = nw; fprintf(stderr, "  [HCSTAT] t=%llu passes=%u maxgap=%ums gap>30=%u wdhskip=%u heldoff=%u (longest run %u passes) workmax=%ums sleepmax=%ums\n", nw, st_n, st_maxgap, st_slow, st_wdh, st_ho, st_homax, st_workmax, st_sleepmax); st_workmax = st_sleepmax = st_homax = 0; fflush(stderr); st_n = st_maxgap = st_slow = st_wdh = st_ho = 0; } }
+         control = hc->reg[HcControl / 4];
+         enable  = hc->reg[HcInterruptEnable / 4];
+ 
+         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
+          * the driver has not started yet is not a test of anything. */
+         if ((control & 0xC0u) != 0x80u) {
+-            if (++waited > 1500)              /* 30 s and it never started */
++            if (++waited && GetTickCount64() - wait_t0 > wait_limit_ms)   /* RECOMP_USB_WAIT_S (default 180 s): never started */
+                 break;
+             continue;
+         }
+@@ -1114,55 +1238,65 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+             plugged = 1;
+-            s_plugged_pads = 1;
++            s_pad_plugged[0] = 1;
+             first_port = port;
+             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
+                             "arriving on port %u\n", waited * 20, port + 1);
+             fflush(stderr);
+         }
+ 
+-        /* More pads, one at a time: each arrives after the previous one is
+-         * configured, on the next port, so the driver enumerates them in
++        /* More pads, one at a time: each arrives after every plugged pad is
++         * configured, on its own port (pad n on first_port + n, which is the
++         * console's controller port n+1), so the driver enumerates them in
+          * turn and there is only ever one device at the default address.
+-         * RECOMP_USB_PADS sets how many (1-4). */
+-        if (plugged && s_plugged_pads < s_npads
+-            && usb_gamepad_configured(s_plugged_pads - 1)) {
+-            if (++settle > 50) {                 /* ~1 s after the last */
+-                unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+-                hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+-                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+-                fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
+-                        s_plugged_pads + 1, port + 1, 10);
+-                fflush(stderr);
+-                s_plugged_pads++;
+-                settle = 0;
+-            }
+-        }
+-
+-        /* The frame clock.
+-         *
+-         * INTR_SF was defined and never raised, and HcFmNumber only moved when
+-         * something read it. That is enough for a driver that polls, and not
+-         * enough for one that waits: USB enumeration is full of delays counted
+-         * in frames -- the recovery time after SET_ADDRESS is the first -- and
+-         * the Xbox stack enables StartOfFrame precisely to count them. Without
+-         * a frame ever starting, enumeration stops one transfer past
+-         * SET_ADDRESS with the driver waiting for time to pass.
+          *
+-         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
+-         * 20. The count is what drivers compare; the rate is what they feel,
+-         * and both are closer to right this way than a counter that never
+-         * moves. */
+-        {
+-            uint32_t hcca = hc->reg[HcHCCA / 4];
+-
+-            hc->reg[HcFmNumber / 4] =
+-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+-            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
+-             * controller zeroes, so a dword write is what hardware does. */
+-            if (hcca)
+-                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
++         * RECOMP_USB_PADS=N plugs pads 1..N and leaves them. Unset, pads 2-4
++         * follow the host: a controller that appears in XInput is plugged
++         * into the next port, and one that goes away for ~1.5 s is unplugged
++         * (the title sees a removal and an arrival, as with a real pad). */
++        if (plugged) {
++            int q, all_configured = 1;
++            static unsigned long absent_since[USB_GAMEPAD_MAX];
++            for (q = 0; q < USB_GAMEPAD_MAX; q++)
++                if (s_pad_plugged[q] && !usb_gamepad_configured(q))
++                    all_configured = 0;
++            for (q = 1; q < USB_GAMEPAD_MAX && (unsigned)q < s_ndp; q++) {
++                unsigned port = (first_port + (unsigned)q) % s_ndp;
++                int want = s_auto_pads ? (xbox_InputPadPresent((DWORD)q) ? 1 : 0) : (q < s_npads);
++                if (want)
++                    absent_since[q] = 0;
++                if (want && !s_pad_plugged[q]) {
++                    if (all_configured && ++settle > 50) {      /* ~1 s after the last */
++                        hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
++                        hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
++                        fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
++                                q + 1, port + 1, 10);
++                        fflush(stderr);
++                        s_pad_plugged[q] = 1;
++                        settle = 0;
++                        all_configured = 0;
++                    }
++                } else if (!want && s_pad_plugged[q] && s_auto_pads) {
++                    unsigned long now = (unsigned long)GetTickCount();
++                    if (!absent_since[q])
++                        absent_since[q] = now ? now : 1;
++                    if (now - absent_since[q] >= 1500) {
++                        uint32_t *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
++                        *ps &= ~(PORT_CCS | PORT_PES);
++                        *ps |= PORT_CSC;
++                        hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
++                        s_pad_plugged[q] = 0;
++                        usb_gamepad_unplug(q);
++                        g_setup_pending_[q] = 0;
++                        g_ctrl_len_[q] = -1;
++                        g_ctrl_sent_[q] = 0;
++                        absent_since[q] = 0;
++                        fprintf(stderr, "  [OHCI0] pad %d removed from port %u%c",
++                                q + 1, port + 1, 10);
++                        fflush(stderr);
++                    }
++                }
++            }
+         }
+ 
+         /* Be the bus master. ControlListEnable in HcControl says the driver
+@@ -1182,8 +1316,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+          * gamepad's reports starting. Leaving the descriptors on their
+          * endpoints for another pass costs a few milliseconds of latency
+          * and is what the controller is specified to do. */
+-        if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
++        if ((hc->reg[HcInterruptStatus / 4] & INTR_WDH)
++            || (hc->reg[HcHCCA / 4]
++                && (rd32(hc->reg[HcHCCA / 4] + HCCA_DONE_HEAD) & ED_PTR_MASK))) {
++            st_wdh++;
+             goto deliver;
++        }
+ 
+         /* PeriodicListEnable, bit 2 of HcControl. */
+         if (control & 0x04u) {
+@@ -1227,6 +1365,29 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+         if (pass_done)
+             ohci_publish_done(hc, pass_done);
+ 
++        /* The frame clock, advanced at the END of the pass.
++         *
++         * The frame number is what the driver's cancel path compares: a
++         * request whose endpoint it set SKIP on is walked and finished
++         * once the frame has moved on, on the assumption that every
++         * descriptor retired before then is already on the done queue
++         * (published together with the new frame number, as the controller
++         * does at the frame boundary). Advancing it at the start of the pass
++         * let the driver see the new frame while this pass was still
++         * retiring descriptors of the old one. The pass is skipped, and the
++         * clock with it, while an earlier queue is unacknowledged or
++         * unconsumed. SF is set with it. */
++        {
++            uint32_t hcca = hc->reg[HcHCCA / 4];
++            /* One frame is one millisecond. Advance by the wall time that has really passed, not by a fixed 4 per pass: when the controller thread is late (a busy PC) the guest's frame-based waits (a cancelled request is finished a frame after the cancel) and its wall-clock timeouts must still agree. */
++            unsigned adv = OHCI_TICK_MS;
++            if (hc_wall) { ULONGLONG nm = GetTickCount64(); ULONGLONG d = nm - fm_last_ms; if (d < 1) d = 1; if (d > 250) d = 250; adv = (unsigned)d; fm_last_ms = nm; }
++            hc->reg[HcFmNumber / 4] =
++                (hc->reg[HcFmNumber / 4] + adv) & 0xFFFFu;
++            if (hcca)
++                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
++            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
++        }
+         /* Level-triggered, which is what OHCI is: while an enabled source is
+          * set, the line is asserted. The handler clears the status bit, so
+          * this stops on its own -- and if it ever does not, the cap below says
+@@ -1268,6 +1429,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+              * the gate the try always succeeds and the leave takes nothing. */
+             gated = xbox_DispatchGateOn() ? xbox_DispatchGateTryEnter()
+                                           : !xbox_IrqlBlocksInterrupts();
++            if (!gated) st_ho++;
++            if (!gated && (unsigned)(held_off + 1) > st_homax) st_homax = (unsigned)(held_off + 1);
+             if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
+                 if (!held_off_warned) {
+                     held_off_warned = 1;
+@@ -1351,8 +1514,9 @@ void xbox_OhciInit(void)
+         }
+         if (padspec) {
+             int n = atoi(padspec);
+-            if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
++            if (n >= 1 && n <= USB_GAMEPAD_MAX) { s_npads = n; s_auto_pads = 0; }
+         }
++        if (s_auto_pads) s_ndp = OHCI_PORTS;     /* a port for every possible pad */
+         if ((unsigned)s_npads > s_ndp)
+             s_ndp = (unsigned)s_npads;      /* a port for every pad */
+     }
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+index bd00f3f..ec31cfc 100644
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -556,7 +556,7 @@ static void pad_script_apply(int pad, uint8_t *out)
+     }
+ }
+ 
+-int usb_gamepad_report(int pad, uint8_t *out, int max)
++static int usb_gamepad_report_raw(int pad, uint8_t *out, int max)
+ {
+     XBOX_INPUT_STATE state;
+     const XBOX_GAMEPAD *g;
+@@ -630,3 +630,51 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+     pad_script_apply(pad, out);
+     return 20;
+ }
++
++/* RECOMP_PAD_DEBUG=1: log each pad's report as the game reads it, when it
++ * changes (at most ~10 lines a second per pad so a moving stick does not
++ * flood the log), plus the first report. Layout:
++ *   id len | buttons(dpad,start,back,L3,R3) reserved | A B X Y Black White LT RT |
++ *   LX LY RX RY (16-bit LE) */
++int usb_gamepad_report(int pad, uint8_t *out, int max)
++{
++    static int dbg = -1;
++    static uint8_t last[USB_GAMEPAD_MAX][20];
++    static unsigned char seen[USB_GAMEPAD_MAX];
++    static unsigned long last_t[USB_GAMEPAD_MAX];
++    static unsigned long nrep[USB_GAMEPAD_MAX];
++    int n = usb_gamepad_report_raw(pad, out, max);
++
++    if (dbg < 0) {
++        const char *e = getenv("RECOMP_PAD_DEBUG");
++        dbg = e && *e && *e != '0';
++    }
++    if (dbg && n == 20 && (unsigned)pad < USB_GAMEPAD_MAX) {
++        unsigned long now = (unsigned long)GetTickCount();
++        nrep[pad]++;
++        if (!seen[pad] || (memcmp(last[pad], out, 20) != 0 && now - last_t[pad] >= 100)) {
++            int i;
++            fprintf(stderr, "  [PAD%d] #%lu report=", pad + 1, nrep[pad]);
++            for (i = 0; i < 20; i++)
++                fprintf(stderr, "%02X%s", out[i], i == 3 || i == 11 ? " | " : " ");
++            fprintf(stderr, " btn=%02X A%u B%u X%u Y%u blk%u wht%u LT%u RT%u "
++                    "L(%d,%d) R(%d,%d)\n", out[2], out[4], out[5], out[6], out[7],
++                    out[8], out[9], out[10], out[11],
++                    (int16_t)(out[12] | out[13] << 8), (int16_t)(out[14] | out[15] << 8),
++                    (int16_t)(out[16] | out[17] << 8), (int16_t)(out[18] | out[19] << 8));
++            fflush(stderr);
++            memcpy(last[pad], out, 20);
++            seen[pad] = 1;
++            last_t[pad] = now;
++        }
++    }
++    return n;
++}
++
++/* The device was unplugged: forget the address and configuration the host
++ * gave it, so the next one to arrive enumerates from scratch. */
++void usb_gamepad_unplug(int pad)
++{
++    s_address[pad & 3] = 0;
++    s_configuration[pad & 3] = 0;
++}
+diff --git a/src/usb/usb_gamepad.h b/src/usb/usb_gamepad.h
+index 18291d7..63d3d78 100644
+--- a/src/usb/usb_gamepad.h
++++ b/src/usb/usb_gamepad.h
+@@ -41,6 +41,9 @@ int usb_gamepad_report(int pad, uint8_t *out, int max);
+ uint8_t usb_gamepad_address(int pad);
+ int usb_gamepad_configured(int pad);
+ 
++/* Forget pad `pad`'s address and configuration (it was unplugged). */
++void usb_gamepad_unplug(int pad);
++
+ /* Up to four pads, one per Xbox controller port. Pad n is driven by host
+  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
+ #define USB_GAMEPAD_MAX 4

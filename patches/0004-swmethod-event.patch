@@ -1,0 +1,124 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index cbeec41..ec8de0b 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -2008,6 +2008,93 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
+     return h;
+ }
+ 
++/* ---- B1x: D3D software methods (NO_OPERATION with a non-zero parameter) ----
++ * On the console the GPU traps those to D3D's PGRAPH handler (sub_0028ECC0 ->
++ * sub_0028EA30 in MvC2). Method 5 is the fence waiter's wake-up: it does
++ * KeSetEvent(context + 0x1A4), context = the NV2A interrupt's ServiceContext
++ * (0x2948C0 + 0x1A4 = 0x294A64, the event sub_002895C0 blocks on). The executor
++ * used to drop it, so a thread that D3D put to sleep behind a far-behind GPU
++ * never woke (the shared B1j/B1n freeze). RECOMP_SWMETHOD_EVENT=0 turns it off.
++ * The offset is the XDK 5028 D3D layout. */
++typedef struct { uint32_t tick, tid, va, src, prev; } KeSetRing;
++static KeSetRing s_ke_ring[64];
++static volatile LONG s_ke_ring_n;
++static volatile LONG s_swm_hits[32];       /* NOP params seen, by (param & 31) */
++static volatile LONG s_swm5_set, s_swm5_nokint, s_swm5_nohandle;
++static uint32_t s_swm5_last_va;
++static void ke_ring_push(uint32_t va, uint32_t src, uint32_t prev)
++{
++    LONG i = InterlockedIncrement(&s_ke_ring_n) - 1;
++    KeSetRing *r = &s_ke_ring[(uint32_t)i & 63];
++    r->tick = (uint32_t)GetTickCount64(); r->tid = GetCurrentThreadId();
++    r->va = va; r->src = src; r->prev = prev;
++}
++
++/* For device models: KeSetEvent on a guest KEVENT from a host thread. */
++int xbox_GuestKeSetEvent(uint32_t guest_va)
++{
++    int type;
++    HANDLE ge, h;
++    if (!guest_va) return 0;
++    ge = ke_guest_event(guest_va, &type);
++    if (ge) {
++        ke_ring_push(guest_va, 1, BRIDGE_MEM32(guest_va + 4));
++        BRIDGE_MEM32(guest_va + 4) = 1;
++        SetEvent(ge);
++        return 1;
++    }
++    h = ke_shadow_lookup(guest_va);
++    if (!h) h = bridge_resolve_handle(guest_va);
++    if (h) { ke_ring_push(guest_va, 2, 0); SetEvent(h); return 1; }
++    return 0;
++}
++
++/* Called by the pushbuffer executor for every NO_OPERATION with a non-zero
++ * parameter (the swap, method 1, is the flip hold's business and is also
++ * reported here). Returns 1 when it handled the method. */
++uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
++int xbox_NV2ASoftwareMethod(uint32_t param)
++{
++    static int s_on = -1;
++    if (s_on < 0) {
++        const char *e = getenv("RECOMP_SWMETHOD_EVENT");
++        s_on = (e && e[0] == '0') ? 0 : 1;
++    }
++    InterlockedIncrement(&s_swm_hits[param & 0x1Fu]);
++    if (!s_on || (param & 0x1Fu) != 5u)
++        return 0;
++    {
++        uint32_t kint = xbox_GetConnectedInterrupt(3 /* NV2A_VECTOR */);
++        uint32_t ctx;
++        if (!kint) { InterlockedIncrement(&s_swm5_nokint); return 0; }
++        ctx = BRIDGE_MEM32(kint + 4);
++        s_swm5_last_va = ctx + 0x1A4u;
++        if (xbox_GuestKeSetEvent(ctx + 0x1A4u)) {
++            LONG c = InterlockedIncrement(&s_swm5_set);
++            if (c <= 3 || (c & (c - 1)) == 0)   /* first few, then powers of two */
++                fprintf(stderr, "[SWM5] D3D software method 5: KeSetEvent(%08X) #%ld\n", ctx + 0x1A4u, (long)c);
++            return 1;
++        }
++        InterlockedIncrement(&s_swm5_nohandle);
++        return 0;
++    }
++}
++
++/* One text block for the stall dump. */
++void xbox_SwMethodDump(FILE *f)
++{
++    int i; LONG n = s_ke_ring_n;
++    fprintf(f, "[SWM] hits by id:");
++    for (i = 0; i < 32; i++) if (s_swm_hits[i]) fprintf(f, " %d=%ld", i, (long)s_swm_hits[i]);
++    fprintf(f, "  m5: set=%ld nokint=%ld nohandle=%ld lastva=%08X\n",
++            (long)s_swm5_set, (long)s_swm5_nokint, (long)s_swm5_nohandle, s_swm5_last_va);
++    fprintf(f, "[SWM] last KeSetEvent ring (src 0=KeSetEvent 1=executor sw-method 2=executor handle) tick tid va src prev:\n");
++    for (i = (n > 32 ? 32 : n); i >= 1; i--) {
++        KeSetRing *r = &s_ke_ring[(uint32_t)(n - i) & 63];
++        fprintf(f, "[SWM]   %u %u %08X %u %u\n", r->tick, r->tid, r->va, r->src, r->prev);
++    }
++}
++
+ /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+ static void bridge_KeSetEvent(void)
+ {
+@@ -2018,6 +2105,7 @@ static void bridge_KeSetEvent(void)
+ 
+     (void)increment;
+     (void)wait;
++    ke_ring_push(guest_va, 0, 0);
+ 
+     {   /* An event the title built itself (see ke_guest_event). */
+         int type;
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 21b8fbb..b708211 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -4121,6 +4121,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             s_gpu.idx[s_gpu.idx_count++] = param;
+         break;
+     case NV097_NO_OPERATION:
++        /* B1x: D3D software method 5 wakes the fence waiter (kernel_bridge.c).
++         * Dropping it froze the title whenever the GPU was far behind. */
++        if (param) {
++            extern int xbox_NV2ASoftwareMethod(uint32_t param);
++            if (xbox_NV2ASoftwareMethod(param))
++                return;
++        }
+         /* Non-zero, it is one of D3D's software methods, which the GPU traps
+          * to D3D's interrupt handler on the console. Only the swap's interval
+          * matters here (nv2a_flip_hold.h); the rest stays a no-op. */

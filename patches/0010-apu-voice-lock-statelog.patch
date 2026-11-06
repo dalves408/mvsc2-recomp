@@ -1,0 +1,404 @@
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 3ec56ca..752ac35 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -128,8 +128,12 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
+  * Voice off / lock
+  * ============================================================ */
+ 
++static int apu_statelog_on(void);
+ static void voice_off(MCPXAPUState *d, uint16_t v)
+ {
++    if (apu_statelog_on() && voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP))
++        fprintf(stderr, "[APU-ST] t=%llu OFF looping v=%u fmt %08X\n", (unsigned long long)GetTickCount64(), v,
++                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu));
+     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
+ 
+@@ -159,8 +163,19 @@ static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
+     InterlockedExchange(&d->vp.voice_spin[v], 0);
+ }
+ 
++/* RECOMP_APU_STATELOG=1: log voice PAUSED/ACTIVE changes and locks held over a second ([APU-ST]). */
++static int apu_statelog_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("RECOMP_APU_STATELOG") != NULL;
++    return on;
++}
++static unsigned long long s_lock_since[MCPX_HW_MAX_VOICES];   /* GetTickCount64 when VOICE_LOCK(1) arrived, 0 = unlocked */
++
+ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
+ {
++    if (v < MCPX_HW_MAX_VOICES)
++        s_lock_since[v] = lock ? GetTickCount64() : 0;
+     assert(v < MCPX_HW_MAX_VOICES);
+     voice_spin_lock(d, v);
+     d->vp.voice_locked[v] = lock;
+@@ -189,6 +204,28 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
+  * Front-End method dispatch
+  * ============================================================ */
+ 
++/* RECOMP_APU_FE_CTX (default on, =0 off): the front end's "current voice" (FECV) and "antecedent voice" (FEAV) per host
++ * thread. DirectSound programs a voice as a sequence -- SET_CURRENT_VOICE, then SET_VOICE_* for it; SET_ANTECEDENT_VOICE,
++ * then VOICE_ON to link it -- and on the console nothing else runs inside a sequence (one CPU, IRQL raised). Here guest
++ * threads are host threads that Windows switches anywhere, so sequences from two threads interleaved and one thread's
++ * writes landed on the other's voice ([APU-FE] interleave: 39 in a 150 s fight, e.g. a full SFX setup written onto the
++ * voice another thread had selected). MvC2's music voice was reconfigured and dropped out of the voice list that way:
++ * the music stops for good and the game stops streaming it. The global registers are still written, for readers.
++ * RESULT 10-27: did NOT stop the cut-out (3 of 3 long runs still lost the music); some cross-thread uses are DirectSound's own
++ * (one thread selects a voice, another programs it under DSound's lock), which this breaks. OPT-IN only (=1). */
++static int apu_fe_ctx_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("RECOMP_APU_FE_CTX"); on = e && e[0] == '1'; }
++    return on;
++}
++static __declspec(thread) uint32_t t_fe_cv, t_fe_av;
++static __declspec(thread) uint8_t t_fe_cv_set, t_fe_av_set;
++#define FE_CV(d) ((t_fe_cv_set && apu_fe_ctx_on()) ? t_fe_cv : (d)->regs[NV_PAPU_FECV])
++#define FE_AV(d) ((t_fe_av_set && apu_fe_ctx_on()) ? t_fe_av : (d)->regs[NV_PAPU_FEAV])
++#define FE_SET_CV(d, x) do { (d)->regs[NV_PAPU_FECV] = (x); t_fe_cv = (x); t_fe_cv_set = 1; } while (0)
++#define FE_SET_AV(d, x) do { (d)->regs[NV_PAPU_FEAV] = (x); t_fe_av = (x); t_fe_av_set = 1; } while (0)
++
+ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ {
+     unsigned int slot;
+@@ -199,11 +236,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ 
+     switch (method) {
+     case NV1BA0_PIO_VOICE_LOCK:
+-        voice_lock(d, (uint16_t)d->regs[NV_PAPU_FECV], argument & 1);
++        voice_lock(d, (uint16_t)FE_CV(d), argument & 1);
+         break;
+ 
+     case NV1BA0_PIO_SET_ANTECEDENT_VOICE:
+-        d->regs[NV_PAPU_FEAV] = argument;
++        FE_SET_AV(d, argument);
+         break;
+ 
+     case NV1BA0_PIO_VOICE_ON: {
+@@ -212,7 +249,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
+         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
+ 
+-        list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
++        list = GET_MASK(FE_AV(d), NV_PAPU_FEAV_LST);
+         if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
+             unsigned int top_reg = voice_list_regs[list - 1].top;
+             voice_set_mask(d, (uint16_t)selected_handle,
+@@ -222,7 +259,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+             d->regs[top_reg] = selected_handle;
+         } else {
+             unsigned int antecedent_voice =
+-                GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
++                GET_MASK(FE_AV(d), NV_PAPU_FEAV_VALUE);
+             assert(antecedent_voice != 0xFFFF);
+ 
+             uint32_t next_handle = voice_get_mask(
+@@ -326,6 +363,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
+                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
+                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
++        if (apu_statelog_on())
++            fprintf(stderr, "[APU-ST] t=%llu FE PAUSE v=%u -> %u\n", (unsigned long long)GetTickCount64(),
++                    argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE, (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
+         break;
+ 
+     case NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY:
+@@ -334,41 +374,41 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+         break;
+ 
+     case NV1BA0_PIO_SET_CURRENT_VOICE:
+-        d->regs[NV_PAPU_FECV] = argument;
++        FE_SET_CV(d, argument);
+         break;
+ 
+     case NV1BA0_PIO_SET_VOICE_CFG_VBIN:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_FMT:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_ENV0:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_ENV0, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_ENVA:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_ENVA, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_ENV1:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_ENV1, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_ENVF:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_ENVF, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_MISC:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CFG_MISC, 0xFFFFFFFF, argument);
+         break;
+ 
+     case NV1BA0_PIO_SET_VOICE_TAR_HRTF: {
+         int handle = GET_MASK(argument, NV1BA0_PIO_SET_VOICE_TAR_HRTF_HANDLE);
+-        int current_voice = d->regs[NV_PAPU_FECV];
++        int current_voice = FE_CV(d);
+         voice_set_mask(d, (uint16_t)current_voice,
+                        NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                        NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE, handle);
+@@ -383,52 +423,52 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+     }
+ 
+     case NV1BA0_PIO_SET_VOICE_TAR_VOLA:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_TAR_VOLB:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_TAR_VOLC:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_VOLC, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_LFO_ENV:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_LFO_ENV, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_TAR_FCA:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_FCA, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_TAR_FCB:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_FCB, 0xFFFFFFFF, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_TAR_PITCH:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_TAR_PITCH_LINK,
+                        NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH,
+                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CUR_PSL_START,
+                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_PAR_OFFSET,
+                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
+         break;
+     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
+-        voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
++        voice_set_mask(d, (uint16_t)FE_CV(d),
+                        NV_PAVS_VOICE_PAR_NEXT,
+                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
+         break;
+@@ -460,7 +500,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ 
+     case NV1BA0_PIO_SET_VOICE_SSL_A: {
+         int ssl = 0;
+-        int current_voice = d->regs[NV_PAPU_FECV];
++        int current_voice = FE_CV(d);
+         assert(current_voice < MCPX_HW_MAX_VOICES);
+         d->vp.ssl[current_voice].base[ssl] =
+             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
+@@ -470,7 +510,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+     }
+     case NV1BA0_PIO_SET_VOICE_SSL_B: {
+         int ssl = 1;
+-        int current_voice = d->regs[NV_PAPU_FECV];
++        int current_voice = FE_CV(d);
+         assert(current_voice < MCPX_HW_MAX_VOICES);
+         d->vp.ssl[current_voice].base[ssl] =
+             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
+@@ -576,14 +616,95 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
+     return 0;
+ }
+ 
++/* RECOMP_APU_FE_LOCK (default on, =0 off): the voice processor stopped taking d->lock per frame (see voice_spin_lock), but
++ * nothing replaced what that lock did for the title's writes. voice_set_mask is a read-modify-write of a voice word in
++ * guest memory, and voice_process rewrites the same words (PAR_STATE envelope state, PAR_OFFSET CBO) every frame: a write
++ * from the title landing inside a voice's frame was overwritten by the processor's stale copy. MvC2's music voice stopped
++ * for good that way (play position frozen, the game stops streaming, silence; 3 of 3 runs within ~6.5 min).
++ * Two halves: a single write takes the voice's spin lock, and (in the frame loop) a voice the title holds with
++ * VOICE_LOCK is skipped for that frame, as xemu stalls it, so a VOICE_LOCK..unlock bracket of writes lands whole. */
++static unsigned s_fe_lock_skips;   /* voice-frames skipped because the title held VOICE_LOCK */
++
++static int apu_fe_lock_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("RECOMP_APU_FE_LOCK"); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++/* The voice a guest method writes, or -1. VOICE_LOCK/ON/RELEASE are left out: they take the spin lock themselves. */
++static int fe_voice_target(MCPXAPUState *d, uint32_t method, uint32_t argument)
++{
++    switch (method) {
++    case NV1BA0_PIO_VOICE_OFF:   return (int)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
++    case NV1BA0_PIO_VOICE_PAUSE: return (int)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE);
++    case NV1BA0_PIO_SET_VOICE_CFG_VBIN: case NV1BA0_PIO_SET_VOICE_CFG_FMT:
++    case NV1BA0_PIO_SET_VOICE_CFG_ENV0: case NV1BA0_PIO_SET_VOICE_CFG_ENVA:
++    case NV1BA0_PIO_SET_VOICE_CFG_ENV1: case NV1BA0_PIO_SET_VOICE_CFG_ENVF:
++    case NV1BA0_PIO_SET_VOICE_CFG_MISC: case NV1BA0_PIO_SET_VOICE_TAR_HRTF:
++    case NV1BA0_PIO_SET_VOICE_TAR_VOLA: case NV1BA0_PIO_SET_VOICE_TAR_VOLB:
++    case NV1BA0_PIO_SET_VOICE_TAR_VOLC: case NV1BA0_PIO_SET_VOICE_LFO_ENV:
++    case NV1BA0_PIO_SET_VOICE_TAR_FCA:  case NV1BA0_PIO_SET_VOICE_TAR_FCB:
++    case NV1BA0_PIO_SET_VOICE_TAR_PITCH: case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
++    case NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO: case NV1BA0_PIO_SET_VOICE_BUF_CBO:
++    case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO: case NV1BA0_PIO_SET_VOICE_SSL_A:
++    case NV1BA0_PIO_SET_VOICE_SSL_B:
++        return (int)(FE_CV(d) & 0xFFFF);
++    default:
++        return -1;
++    }
++}
++
+ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+                         unsigned int size)
+ {
+     MCPXAPUState *d = (MCPXAPUState *)opaque;
++    int v = apu_fe_lock_on() ? fe_voice_target(d, (uint32_t)addr, (uint32_t)val) : -1;
+     (void)size;
+ 
++    if (v >= MCPX_HW_MAX_VOICES)
++        v = -1;
++    if (apu_statelog_on()) {
++        /* Front-end method sequences rely on shared registers: SET_CURRENT_VOICE then SET_VOICE_* (FECV), and
++         * SET_ANTECEDENT_VOICE then VOICE_ON (FEAV, the voice-list link). A write that uses FECV/FEAV set by ANOTHER host
++         * thread means two sequences interleaved (the console's single CPU and DirectSound's IRQL raise prevent that). */
++        static DWORD cv_tid, av_tid;
++        static unsigned foreign;
++        DWORD tid = GetCurrentThreadId();
++        uint32_t m = (uint32_t)addr;
++        if (m == NV1BA0_PIO_SET_CURRENT_VOICE) cv_tid = tid;
++        else if (m == NV1BA0_PIO_SET_ANTECEDENT_VOICE) av_tid = tid;
++        else {
++            int uses_cv = fe_voice_target(d, m, (uint32_t)val) >= 0 && m != NV1BA0_PIO_VOICE_OFF && m != NV1BA0_PIO_VOICE_PAUSE;
++            int uses_av = m == NV1BA0_PIO_VOICE_ON;
++            if (m == NV1BA0_PIO_VOICE_LOCK) uses_cv = 1;
++            if ((uses_cv && cv_tid && cv_tid != tid) || (uses_av && av_tid && av_tid != tid)) {
++                if (++foreign <= 80 || foreign % 500 == 0)
++                    fprintf(stderr, "[APU-FE] t=%llu interleave #%u: thread %lu method %04X arg %08X uses %s set by thread %lu (FECV %u FEAV %08X)\n",
++                            (unsigned long long)GetTickCount64(), foreign, tid, m, (unsigned)val, uses_av ? "FEAV" : "FECV",
++                            uses_av ? av_tid : cv_tid, (unsigned)d->regs[NV_PAPU_FECV], (unsigned)d->regs[NV_PAPU_FEAV]);
++            }
++        }
++    }
++    if (apu_statelog_on()) {   /* every write that touches a looping voice (the music), or links a voice into a list */
++        uint32_t m = (uint32_t)addr;
++        int tv = fe_voice_target(d, m, (uint32_t)val);
++        if (m == NV1BA0_PIO_VOICE_ON || m == NV1BA0_PIO_VOICE_RELEASE) tv = (int)(val & NV1BA0_PIO_VOICE_ON_HANDLE);
++        if (m == NV1BA0_PIO_VOICE_LOCK) tv = (int)(FE_CV(d) & 0xFFFF);
++        if (tv >= 0 && tv < MCPX_HW_MAX_VOICES
++                && voice_get_mask(d, (uint16_t)tv, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP)
++                && m != NV1BA0_PIO_SET_VOICE_TAR_VOLA && m != NV1BA0_PIO_SET_VOICE_TAR_VOLB && m != NV1BA0_PIO_SET_VOICE_TAR_VOLC
++                && m != NV1BA0_PIO_SET_VOICE_TAR_PITCH && m != NV1BA0_PIO_VOICE_LOCK)
++            fprintf(stderr, "[APU-LOOPW] t=%llu thread %lu method %04X arg %08X on looping v=%d (active %u)\n",
++                    (unsigned long long)GetTickCount64(), GetCurrentThreadId(), m, (unsigned)val, tv,
++                    voice_get_mask(d, (uint16_t)tv, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE));
++    }
++    if (v >= 0)
++        voice_spin_lock(d, (uint16_t)v);
+     /* Dispatch known methods through fe_method */
+     fe_method(d, (uint32_t)addr, (uint32_t)val);
++    if (v >= 0)
++        voice_spin_unlock(d, (uint16_t)v);
+ }
+ 
+ /* ============================================================
+@@ -1694,13 +1815,50 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                  * idle voice in the same frame would overwrite FEDECPARAM
+                  * before the ISR has read the first. The rest trap on later
+                  * frames, after the ISR has resumed the front end. */
++                if (apu_statelog_on() && voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP)) {
++                    static unsigned long long last_idle[MCPX_HW_MAX_VOICES];
++                    unsigned long long t = GetTickCount64();
++                    if (t - last_idle[v] > 1000) { last_idle[v] = t; fprintf(stderr, "[APU-ST] t=%llu VP looping v=%u in list but INACTIVE (idle trap)\n", t, v); }
++                }
+                 if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                         != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                     fe_method(d, SE2FE_IDLE_VOICE, v);
+             } else {
+-                /* Process voice directly (single-threaded) */
++                /* Process voice directly (single-threaded). A voice the title
++                 * holds with VOICE_LOCK sits this frame out (RECOMP_APU_FE_LOCK). */
+                 voice_spin_lock(d, v);
+-                voice_process(d, mixbins, d->vp.sample_buf, v, list);
++                if (apu_statelog_on()) {
++                    static uint8_t seen[MCPX_HW_MAX_VOICES], lockrep[MCPX_HW_MAX_VOICES];
++                    uint32_t st = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu);
++                    uint8_t now = (uint8_t)(1 | ((st & NV_PAVS_VOICE_PAR_STATE_PAUSED) ? 2 : 0));
++                    unsigned long long t = GetTickCount64();
++                    if (seen[v] != now) {
++                        fprintf(stderr, "[APU-ST] t=%llu VP v=%u paused %u -> %u (state %08X fmt %08X cbo %u)\n", t, v,
++                                (seen[v] >> 1) & 1, (now >> 1) & 1, st,
++                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
++                                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO));
++                        seen[v] = now;
++                    }
++                    {   /* every 2 s: play position of looping voices (music) */
++                        static unsigned long long last_pos[MCPX_HW_MAX_VOICES];
++                        if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP) && t - last_pos[v] >= 2000) {
++                            last_pos[v] = t;
++                            fprintf(stderr, "[APU-POS] t=%llu v=%u cbo %u lbo %u ebo %u locked %d\n", t, v,
++                                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
++                                    voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE, NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
++                                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
++                                    is_voice_locked(d, v) ? 1 : 0);
++                        }
++                    }
++                    if (s_lock_since[v] && t - s_lock_since[v] > 1000) {
++                        if (!lockrep[v]) { lockrep[v] = 1; fprintf(stderr, "[APU-ST] t=%llu v=%u LOCKED for %llu ms\n", t, v, t - s_lock_since[v]); }
++                    } else
++                        lockrep[v] = 0;
++                }
++                if (!(apu_fe_lock_on() && is_voice_locked(d, v)))
++                    voice_process(d, mixbins, d->vp.sample_buf, v, list);
++                else
++                    s_fe_lock_skips++;
+                 voice_spin_unlock(d, v);
+             }
+             d->regs[current] = d->regs[next];
+@@ -1709,6 +1867,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+ 
+     vp_trace_positions(d);
+     vp_stat_report();
++    {   /* ~once a minute (1500 frames/s): how often a locked voice sat a frame out */
++        static unsigned frames, last;
++        if (++frames % 90000u == 0 && s_fe_lock_skips != last) {
++            fprintf(stderr, "[APU] voice-lock skips %u (+%u)\n", s_fe_lock_skips, s_fe_lock_skips - last);
++            last = s_fe_lock_skips;
++        }
++    }
+     if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
+         vp_ring_report(++s_ring_secs);
+ 

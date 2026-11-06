@@ -1,0 +1,266 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 8908512..cbeec41 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -2715,8 +2715,14 @@ int xbox_DpcQueue(uint32_t dpc, uint32_t arg1, uint32_t arg2)
+     LeaveCriticalSection(&g_dpc_lock);
+     /* The timer thread may be asleep to its next vblank edge, 10 ms away:
+      * a DPC that no guest thread picks up at a raise would wait it out. */
+-    if (xbox_DpcOnRaise())
+-        xbox_HostTimerWake();
++    /* RECOMP_DPC_WAKE=1 wakes the timer thread for every queued DPC, not only under the gate: with the gate off an
++     * ISR-queued DPC otherwise waits for the thread's own tick (up to 10 ms). */
++    {
++        static int wake = -1;
++        if (wake < 0) { const char *e = getenv("RECOMP_DPC_WAKE"); wake = e ? atoi(e) : 0; }
++        if (wake || xbox_DpcOnRaise())
++            xbox_HostTimerWake();
++    }
+     return 1;
+ }
+ 
+@@ -3328,11 +3334,32 @@ static int dpc_pop(PendingDpc *d)
+ /* Run whatever is queued. Called from the timer thread, which has the guest
+  * stack and TIB that a deferred routine needs. Returns 1 when it stopped on
+  * a busy gate with DPCs still queued; *ran counts the DPCs it ran. */
++static int s_dpc_defer = -1;               /* RECOMP_DPC_DEFER */
++static ULONGLONG s_blocked_since;
++static int s_warned;
+ static int kernel_drain_dpcs(int *ran)
+ {
+     *ran = 0;
+     for (;;) {
+         PendingDpc d;
++        /* RECOMP_DPC_DEFER=1 (MvC2 patch): with the dispatch gate off nothing stops this thread draining DPCs while a guest thread is
++         * between its raise to DISPATCH and its lower, which a console never allows: the DPC (a USB completion) then edits structures the
++         * raised thread is reading and writing. Hold the queue while any thread is raised, for at most 250 ms (a leaked or very long
++         * raise must not stop vblank and timer DPCs for good). Only the timer thread gets here with the gate off, so the statics are safe. */
++        if (s_dpc_defer < 0) { const char *e = getenv("RECOMP_DPC_DEFER"); s_dpc_defer = e ? atoi(e) : 0; }
++        if (s_dpc_defer && !xbox_DispatchGateOn() && xbox_IrqlBlocksInterrupts()) {
++            ULONGLONG now = GetTickCount64();
++            if (!s_blocked_since) s_blocked_since = now;
++            if (now - s_blocked_since < 250)
++                return g_dpc_head != g_dpc_tail;
++            if (!s_warned) {
++                s_warned = 1;
++                fprintf(stderr, "  [KERNEL] guest IRQL raised for 250 ms; running DPCs anyway\n");
++                fflush(stderr);
++            }
++        } else {
++            s_blocked_since = 0;
++        }
+         /* A DPC runs only while the one-CPU gate is free (no thread at
+          * DISPATCH_LEVEL, no ISR or KeSynchronizeExecution routine), and
+          * never waits for it: this thread is also the vblank and timer
+@@ -3748,6 +3775,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+     int slot = xbox_worker_stack_alloc();
+ 
+     (void)unused;
++    { const char *e = getenv("RECOMP_TIMER_PRIO"); if (e && *e) SetThreadPriority(GetCurrentThread(), atoi(e)); }
+     if (slot < 0) {
+         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
+                         "timer DPCs will not run\n");
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 2651871..018f589 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -383,7 +383,15 @@ NTSTATUS __stdcall xbox_NtReadFile(
+     if (result || GetLastError() == ERROR_HANDLE_EOF) {
+         IoStatusBlock->Information = bytes_read;
+         if (bytes_read == 0 && Length > 0) {
++            /* NT signals the completion event for every completed request, EOF included. A guest that
++               waits on the event after a read past the end of the file (the streaming loader does) would
++               otherwise wait forever. */
++            static LONG s_eof_logged;
++            if (InterlockedIncrement(&s_eof_logged) <= 8)
++                fprintf(stderr, "[NTREAD] EOF read len=%u off=%lld event=%p\n", Length,
++                        ByteOffset ? (long long)ByteOffset->QuadPart : -1LL, (void *)Event);
+             IoStatusBlock->Status = STATUS_END_OF_FILE;
++            if (Event) SetEvent(Event);
+             return STATUS_END_OF_FILE;
+         }
+         IoStatusBlock->Status = STATUS_SUCCESS;
+@@ -391,10 +399,12 @@ NTSTATUS __stdcall xbox_NtReadFile(
+         return STATUS_SUCCESS;
+     }
+ 
++    fprintf(stderr, "[NTREAD] FAILED len=%u off=%lld err=%lu\n", Length, ByteOffset ? (long long)ByteOffset->QuadPart : -1LL, (unsigned long)GetLastError());
+     XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
+                FileHandle, Length, GetLastError());
+     IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+     IoStatusBlock->Information = 0;
++    if (Event) SetEvent(Event);
+     return STATUS_UNSUCCESSFUL;
+ }
+ 
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 45d548c..a396541 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -851,6 +851,29 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
+     if (!now && t_dispatch_gate_held)
+         xbox_IrqSafePoint();
+     t_irql_counted = now;
++    /* RECOMP_IRQL_STAT=1: longest span a thread stayed at or above DISPATCH_LEVEL, printed each time it grows past 10 ms. */
++    {
++        static int stat = -1;
++        static XBOX_THREAD_LOCAL LONGLONG t0;
++        static volatile LONG maxms;
++        if (stat < 0) stat = getenv("RECOMP_IRQL_STAT") != NULL;
++        if (stat) {
++            LARGE_INTEGER q, f;
++            QueryPerformanceCounter(&q);
++            if (now) t0 = q.QuadPart;
++            else if (t0) {
++                LONG ms;
++                QueryPerformanceFrequency(&f);
++                ms = (LONG)((q.QuadPart - t0) * 1000 / f.QuadPart);
++                t0 = 0;
++                if (ms >= 10 && ms > maxms) {
++                    maxms = ms;
++                    fprintf(stderr, "  [IRQLSTAT] tid %lu raised region %ld ms (new max)\n", (unsigned long)GetCurrentThreadId(), (long)ms);
++                    fflush(stderr);
++                }
++            }
++        }
++    }
+ 
+     if (now && gate && xbox_DispatchGateOn()) {
+         gate_enter();
+diff --git a/src/kernel/kernel_thread.c b/src/kernel/kernel_thread.c
+index 9afbbe3..4921074 100644
+--- a/src/kernel/kernel_thread.c
++++ b/src/kernel/kernel_thread.c
+@@ -350,6 +350,102 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
+     return STATUS_SUCCESS;
+ }
+ 
++
++/*
++ * Lost-wakeup guard (default ON; RECOMP_RESUME_TOKEN=0 disables).
++ * The title's streaming worker (sub_002000A0) parks itself with NtSuspendThread(self)
++ * after each pass; the main thread starts a pass with NtResumeThread (and, if the
++ * worker's flag is not cleared at once, resumes again a few times). On the console the
++ * worker is a higher-priority thread on a single CPU, so by the time the resume returns
++ * the pass has run and the worker is suspended again. On the host the two run in parallel:
++ * a resume that lands while the worker is still finishing its previous pass (suspend count 0)
++ * is lost, and the worker then suspends itself with work pending and never wakes.
++ * Guard: (1) a resume that finds its target not suspended leaves one token, which the
++ * target's next self-suspend consumes (returns at once, the worker just re-checks its queue);
++ * (2) a resume that finds its target committed to suspending (between the token check and
++ * the real SuspendThread) retries until the suspend has taken effect, then resumes it.
++ */
++#define RT_MAX 128
++static struct { DWORD tid; LONG tok; LONG suspending; } s_rt[RT_MAX];
++static SRWLOCK s_rt_lock = SRWLOCK_INIT;
++static int s_rt_on = -1;
++static volatile LONG s_rt_set_n, s_rt_hit_n, s_rt_race_n;
++static int rt_enabled(void)
++{
++    if (s_rt_on < 0) { const char *e = getenv("RECOMP_RESUME_TOKEN"); s_rt_on = (e && e[0] == '0') ? 0 : 1; }
++    return s_rt_on;
++}
++/* caller holds the lock */
++static int rt_find(DWORD tid, int create)
++{
++    int i, free_i = -1;
++    for (i = 0; i < RT_MAX; i++) {
++        if (s_rt[i].tid == tid) return i;
++        if (free_i < 0 && s_rt[i].tid == 0) free_i = i;
++    }
++    if (create && free_i >= 0) { s_rt[free_i].tid = tid; s_rt[free_i].tok = 0; s_rt[free_i].suspending = 0; return free_i; }
++    return -1;
++}
++/* Self-suspend: returns 1 if a pending resume was consumed (do not suspend). */
++static int rt_self_suspend_begin(DWORD tid)
++{
++    int i, consumed = 0;
++    AcquireSRWLockExclusive(&s_rt_lock);
++    i = rt_find(tid, 1);
++    if (i >= 0) {
++        if (s_rt[i].tok) { s_rt[i].tok = 0; consumed = 1; }
++        else s_rt[i].suspending = 1;
++    }
++    ReleaseSRWLockExclusive(&s_rt_lock);
++    return consumed;
++}
++static void rt_self_suspend_end(DWORD tid)
++{
++    int i;
++    AcquireSRWLockExclusive(&s_rt_lock);
++    i = rt_find(tid, 0);
++    if (i >= 0) s_rt[i].suspending = 0;
++    ReleaseSRWLockExclusive(&s_rt_lock);
++}
++static DWORD rt_resume(HANDLE h)
++{
++    DWORD prev, tid = GetThreadId(h);
++    int i, n;
++    if (!tid) return ResumeThread(h);
++    AcquireSRWLockExclusive(&s_rt_lock);
++    i = rt_find(tid, 0);
++    if (i >= 0 && s_rt[i].suspending) {
++        /* target is committed to suspend itself: wait until the suspend has taken effect */
++        for (n = 0; n < 4000; n++) {
++            prev = ResumeThread(h);
++            if (prev != 0) {
++                if (n) InterlockedIncrement(&s_rt_race_n);
++                s_rt[i].suspending = 0;
++                ReleaseSRWLockExclusive(&s_rt_lock);
++                return prev;
++            }
++            if (n < 200) SwitchToThread(); else Sleep(0);
++        }
++        s_rt[i].tok = 1;            /* gave up: leave a token instead */
++        InterlockedIncrement(&s_rt_set_n);
++        ReleaseSRWLockExclusive(&s_rt_lock);
++        return 0;
++    }
++    prev = ResumeThread(h);
++    if (prev == 0) {
++        i = rt_find(tid, 1);
++        if (i >= 0) { s_rt[i].tok = 1; InterlockedIncrement(&s_rt_set_n); }
++    }
++    ReleaseSRWLockExclusive(&s_rt_lock);
++    return prev;
++}
++/* diagnostics for the stall dump in main.c */
++void xbox_rt_dump(void)
++{
++    int i;
++    fprintf(stderr, "[RTDUMP] enabled=%d set=%ld hit=%ld race=%ld\n", rt_enabled(), (long)s_rt_set_n, (long)s_rt_hit_n, (long)s_rt_race_n);
++    for (i = 0; i < RT_MAX; i++) if (s_rt[i].tid) fprintf(stderr, "[RTDUMP]  tid=%lu tok=%ld suspending=%ld\n", (unsigned long)s_rt[i].tid, (long)s_rt[i].tok, (long)s_rt[i].suspending);
++}
+ NTSTATUS __stdcall xbox_NtSuspendThread(
+     HANDLE ThreadHandle,
+     PULONG PreviousSuspendCount)
+@@ -362,6 +458,20 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
+      * the two are not interchangeable: -1 must become an error status rather
+      * than a suspend count of 0xFFFFFFFF.
+      */
++    if (rt_enabled() && GetThreadId(ThreadHandle) == GetCurrentThreadId()) {
++        DWORD me = GetCurrentThreadId();
++        if (rt_self_suspend_begin(me)) {
++            LONG n = InterlockedIncrement(&s_rt_hit_n);
++            if (n <= 20 || (n % 1000) == 0) fprintf(stderr, "[RESUMETOKEN] self-suspend skipped (pending resume) tid=%lu hit#%ld set#%ld race#%ld\n", me, n, s_rt_set_n, s_rt_race_n);
++            if (PreviousSuspendCount) *PreviousSuspendCount = 0;
++            return STATUS_SUCCESS;
++        }
++        prev = SuspendThread(ThreadHandle);
++        rt_self_suspend_end(me);
++        if (prev == (DWORD)-1) return STATUS_UNSUCCESSFUL;
++        if (PreviousSuspendCount) *PreviousSuspendCount = (ULONG)prev;
++        return STATUS_SUCCESS;
++    }
+     prev = SuspendThread(ThreadHandle);
+     if (prev == (DWORD)-1) {
+         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
+@@ -385,7 +495,7 @@ NTSTATUS __stdcall xbox_NtResumeThread(
+     DWORD prev;
+ 
+     /* Mirror of NtSuspendThread: (DWORD)-1 is failure, not a count. */
+-    prev = ResumeThread(ThreadHandle);
++    prev = rt_enabled() ? rt_resume(ThreadHandle) : ResumeThread(ThreadHandle);
+     if (prev == (DWORD)-1) {
+         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
+             "NtResumeThread: ResumeThread failed (error %u)", GetLastError());

@@ -1,0 +1,49 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -5670,16 +5670,41 @@ static void bridge_KeDisconnectInterrupt(void)
+ /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
+  * existed in kernel_thread.c all along; only the bridge wrapper was
+  * missing, so the thunk fell through to the fallback and returned 0. */
++/* The argument is a guest thread object, not a host handle: passed on as it was, every call failed with
++ * ERROR_INVALID_HANDLE and the title's priorities never took effect. They matter: on one CPU a thread that raises itself
++ * to priority 15 or 16 keeps other threads out, and MvC2 does that around its own sections about 100 times a second. Objects
++ * with no shadow are the main thread's, the only one not started through bridge_spawn_thread.
++ * Priorities below normal are held at normal: here the main thread spins on the GPU on the same core, where the console's
++ * would be waiting, so a lower thread would starve.
++ * RECOMP_GUEST_PRIO: 2 (default) sets the small lasting priorities and leaves out the raises to 15+ and their returns to 0;
++ * 1 sets everything; 0 sets nothing. In MvC2 =1 ends about 30% of button-mash runs in the title's decompression-error halt
++ * (sub_00200F20, an endless loop) during a stage load; the reason is not known. */
++static HANDLE bridge_thread_host(uint32_t obj)
++{
++    HANDLE h = ke_shadow_lookup(obj);
++    return h ? h : GetCurrentThread();
++}
++
++static int guest_prio_mode(void)
++{
++    static int mode = -1;
++    if (mode < 0) { const char *e = getenv("RECOMP_GUEST_PRIO"); mode = (e && *e) ? atoi(e) : 2; }
++    return mode;
++}
++
+ static void bridge_KeQueryBasePriorityThread(void)
+ {
+-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
+-        XBOX_TO_NATIVE(STACK_ARG(0)));
++    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(bridge_thread_host(STACK_ARG(0)));
+ }
+ 
+ static void bridge_KeSetBasePriorityThread(void)
+ {
+-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
+-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
++    LONG inc = (LONG)STACK_ARG(1);
++    int mode = guest_prio_mode();
++    g_eax = 0;
++    if (mode == 0 || (mode == 2 && (inc >= 15 || inc == 0)))
++        return;
++    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(bridge_thread_host(STACK_ARG(0)), inc < 0 ? 0 : inc);
+ }
+ 
+ /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */

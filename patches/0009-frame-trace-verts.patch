@@ -1,0 +1,27 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index dbccd0e..6f20e78 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3376,6 +3376,22 @@ static void draw_primitive(void)
+                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
+                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
+                         s_xf[2].pos[0], s_xf[2].pos[1], 10);
++            {   /* RECOMP_FRAME_TRACE_VERTS: every vertex's screen position and the
++                 * texture coordinates the program wrote, for texture-mapping bugs. */
++                static int verts = -1;
++                if (verts < 0)
++                    verts = getenv("RECOMP_FRAME_TRACE_VERTS") != NULL;
++                if (verts && (s_gpu.xf_mode & 3) == 2 && s_xf) {
++                    uint32_t k;
++                    fprintf(stderr, "[FTRACE]     tex0 addr %X/%X\n",
++                            s_gpu.texs[0].addr_u, s_gpu.texs[0].addr_v);
++                    for (k = 0; k < s_gpu.idx_count && k < 96; k++)
++                        fprintf(stderr, "[FTRACE]     vx%u %.1f %.1f w %g | t0 %g %g %g %g%c", k,
++                                s_xf[k].pos[0], s_xf[k].pos[1], s_xf[k].pos[3],
++                                s_xf[k].tex[0][0], s_xf[k].tex[0][1],
++                                s_xf[k].tex[0][2], s_xf[k].tex[0][3], 10);
++                }
++            }
+             if (s_gpu.rc_seen) {
+                 int st;
+                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",

@@ -1,0 +1,63 @@
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 775612f..cd4cb8c 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -2233,8 +2233,18 @@ class Lifter:
+     def _lift_imul(self, insn, ops):
+         nops = len(ops)
+         if nops == 1:
+-            # One operand: edx:eax = eax * ops[0]
++            # One operand. The width decides the registers: 8-bit is ax = al * src
++            # and leaves edx alone (titles keep a live pointer there), 16-bit is
++            # dx:ax = ax * src, 32-bit is edx:eax = eax * src.
+             src = _fmt_operand_read(ops[0])
++            width = _operand_width(ops[0]) or 4
++            if width == 1:
++                return [f"SET_LO16(eax, (uint16_t)((int32_t)(int8_t)LO8(eax) * (int32_t)(int8_t){src}));"]
++            if width == 2:
++                return [
++                    f"{{ int32_t _r = (int32_t)(int16_t)LO16(eax) * (int32_t)(int16_t){src};",
++                    f"  SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)((uint32_t)_r >> 16)); }}"
++                ]
+             return [
+                 f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
+                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+@@ -2255,6 +2265,38 @@ class Lifter:
+         if len(ops) < 1:
+             return [f"/* {m}: no operand */"]
+         src = _fmt_operand_read(ops[0])
++        width = _operand_width(ops[0]) or 4
++        # 8-bit: ax is the wide value, al/ah the results. 16-bit: dx:ax, ax/dx.
++        # Only 32-bit touches all of eax and edx (see _lift_imul).
++        if width == 1:
++            if m == "mul":
++                return [f"SET_LO16(eax, (uint16_t)((uint32_t)LO8(eax) * (uint32_t)(uint8_t){src}));"]
++            if m == "div":
++                return [
++                    f"{{ uint32_t _n = LO16(eax), _d = (uint8_t){src};",
++                    f"  SET_LO16(eax, (uint16_t)((_n / _d) & 0xFFu) | (uint16_t)((_n % _d) << 8)); }}"
++                ]
++            if m == "idiv":
++                return [
++                    f"{{ int32_t _n = (int16_t)LO16(eax), _d = (int8_t){src};",
++                    f"  SET_LO16(eax, (uint16_t)(((uint32_t)(_n / _d) & 0xFFu) | (((uint32_t)(_n % _d) & 0xFFu) << 8))); }}"
++                ]
++        if width == 2:
++            if m == "mul":
++                return [
++                    f"{{ uint32_t _r = (uint32_t)LO16(eax) * (uint32_t)(uint16_t){src};",
++                    f"  SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)(_r >> 16)); }}"
++                ]
++            if m == "div":
++                return [
++                    f"{{ uint32_t _n = ((uint32_t)LO16(edx) << 16) | LO16(eax), _d = (uint16_t){src};",
++                    f"  SET_LO16(eax, (uint16_t)(_n / _d)); SET_LO16(edx, (uint16_t)(_n % _d)); }}"
++                ]
++            if m == "idiv":
++                return [
++                    f"{{ int32_t _n = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax)), _d = (int16_t){src};",
++                    f"  SET_LO16(eax, (uint16_t)(_n / _d)); SET_LO16(edx, (uint16_t)(_n % _d)); }}"
++                ]
+         if m == "mul":
+             return [
+                 f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",

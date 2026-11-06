@@ -1,0 +1,200 @@
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -249,6 +249,21 @@ def _fmt_mem(op):
+     return " + ".join(parts)
+ 
+ 
++def _rmw_shared(op):
++    """A memory operand other threads may touch: anything but the thread's own stack and TIB.
++
++    `dec dword [refcount]` is one instruction, so on the console's one CPU no
++    other thread can run inside it and titles use it unlocked. Lifted as a
++    separate load, store and read-back for the flags, a thread switch lands in
++    the middle: an update is lost, or two threads both see the count reach zero
++    and both free the object. So these lift through recomp_rmw_*, which are one
++    atomic step and return the old value the flags are worked out from.
++    """
++    if op.type != "mem" or getattr(op, "mem_seg", None) == "fs":
++        return False
++    return str(op.mem_base or "").lower() != "esp"
++
++
+ def _fmt_mem_read(op):
+     """Format reading from a memory operand."""
+     accessor = _mem_accessor(op.mem_size)
+@@ -2107,6 +2122,22 @@ class Lifter:
+         out = []
+         if m in _RESULT_SRC_SETTERS:
+             out.append(self._result_snapshot(ops, m, src_too=True))
++        if _rmw_shared(ops[0]):
++            size = _operand_width(ops[0]) or 4
++            mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
++            fn = {"add": "add", "sub": "add", "and": "and", "or": "or", "xor": "xor"}[m]
++            arg = "0u - _s" if m == "sub" else "_s"
++            out.append(f"{{ uint32_t _s = (uint32_t)({src});"
++                       f" uint32_t _o = recomp_rmw_{fn}{size * 8}({_fmt_mem(ops[0])}, {arg});")
++            if self.needs_cf:
++                if m == "add":
++                    out.append(f"  _cf = (int)((((uint64_t)(_o & {mask}) + (uint64_t)(_s & {mask})) >> {size * 8}) & 1);")
++                elif m == "sub":
++                    out.append(f"  _cf = (int)((_o & {mask}) < (_s & {mask}));")
++                else:
++                    out.append("  _cf = 0; /* logical op clears CF */")
++            out.append(f"  _fa = (uint32_t)(_o {c_op} _s) & {mask}; _fas = (int32_t){sx}(_fa); }} /* {m} result */")
++            return out
+         if self.needs_cf:
+             # CF must be computed from the pre-write operands.
+             if m == "add":
+@@ -2127,14 +2158,19 @@ class Lifter:
+         delta = "1"
+         op_char = "+" if m == "inc" else "-"
+         # For sub-registers (al, cl, etc.), use the SET macro instead of ++
++        size = _operand_width(ops[0]) or 4
++        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
++        overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
++        if _rmw_shared(ops[0]):
++            arg = "1u" if m == "inc" else "0u - 1u"
++            return [f"{{ uint32_t _o = recomp_rmw_add{size * 8}({_fmt_mem(ops[0])}, {arg});"
++                    f" _fa = (uint32_t)(_o {op_char} 1u) & {mask}; }}",
++                    f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+         if ops[0].type == "reg" and ops[0].reg in (
+                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"):
+             out = [f"{val}{'++' if m == 'inc' else '--'};"]
+         else:
+             out = [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+-        size = _operand_width(ops[0]) or 4
+-        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+-        overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
+         out += [f"_fa = (uint32_t)({val}) & {mask};",
+                 f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+         return out
+@@ -2155,6 +2191,9 @@ class Lifter:
+         if len(ops) < 1:
+             return ["/* not: no operand */"]
+         val = _fmt_operand_read(ops[0])
++        if _rmw_shared(ops[0]):
++            size = _operand_width(ops[0]) or 4
++            return [f"(void)recomp_rmw_xor{size * 8}({_fmt_mem(ops[0])}, 0xFFFFFFFFu);"]
+         return [_fmt_operand_write(ops[0], f"~{val}")]
+ 
+     def _lift_sbb(self, insn, ops):
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -231,6 +231,48 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
+ #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+ #endif
+ 
++/* Unlocked read-modify-write instructions on shared memory (dec dword [refcount], or byte [flags], 1). One instruction is
++ * one step for other threads on the console's one CPU, so they must be one step here: see _rmw_shared in the lifter. They
++ * return the old value. Hardware registers stay a plain read and write: those addresses trap, and the trap handlers decode
++ * ordinary moves. */
++#if defined(_MSC_VER)
++#define RECOMP_RMW_DEF(name, bits, type, ltype, intr, op) \
++    static __inline uint32_t recomp_rmw_##name##bits(uint32_t va, uint32_t v) { \
++        volatile type *p = (volatile type *)((uintptr_t)va + g_xbox_mem_offset); \
++        if (va >= 0xFD000000u) { type o = *p; *p = (type)(o op (type)v); return o; } \
++        return (type)intr((volatile ltype *)p, (ltype)v); }
++RECOMP_RMW_DEF(add, 8, uint8_t, char, _InterlockedExchangeAdd8, +)
++RECOMP_RMW_DEF(add, 16, uint16_t, short, _InterlockedExchangeAdd16, +)
++RECOMP_RMW_DEF(add, 32, uint32_t, long, _InterlockedExchangeAdd, +)
++RECOMP_RMW_DEF(and, 8, uint8_t, char, _InterlockedAnd8, &)
++RECOMP_RMW_DEF(and, 16, uint16_t, short, _InterlockedAnd16, &)
++RECOMP_RMW_DEF(and, 32, uint32_t, long, _InterlockedAnd, &)
++RECOMP_RMW_DEF(or, 8, uint8_t, char, _InterlockedOr8, |)
++RECOMP_RMW_DEF(or, 16, uint16_t, short, _InterlockedOr16, |)
++RECOMP_RMW_DEF(or, 32, uint32_t, long, _InterlockedOr, |)
++RECOMP_RMW_DEF(xor, 8, uint8_t, char, _InterlockedXor8, ^)
++RECOMP_RMW_DEF(xor, 16, uint16_t, short, _InterlockedXor16, ^)
++RECOMP_RMW_DEF(xor, 32, uint32_t, long, _InterlockedXor, ^)
++#else
++#define RECOMP_RMW_DEF(name, bits, type, gcc, op) \
++    static inline uint32_t recomp_rmw_##name##bits(uint32_t va, uint32_t v) { \
++        volatile type *p = (volatile type *)((uintptr_t)va + g_xbox_mem_offset); \
++        if (va >= 0xFD000000u) { type o = *p; *p = (type)(o op (type)v); return o; } \
++        return gcc(p, (type)v); }
++RECOMP_RMW_DEF(add, 8, uint8_t, __sync_fetch_and_add, +)
++RECOMP_RMW_DEF(add, 16, uint16_t, __sync_fetch_and_add, +)
++RECOMP_RMW_DEF(add, 32, uint32_t, __sync_fetch_and_add, +)
++RECOMP_RMW_DEF(and, 8, uint8_t, __sync_fetch_and_and, &)
++RECOMP_RMW_DEF(and, 16, uint16_t, __sync_fetch_and_and, &)
++RECOMP_RMW_DEF(and, 32, uint32_t, __sync_fetch_and_and, &)
++RECOMP_RMW_DEF(or, 8, uint8_t, __sync_fetch_and_or, |)
++RECOMP_RMW_DEF(or, 16, uint16_t, __sync_fetch_and_or, |)
++RECOMP_RMW_DEF(or, 32, uint32_t, __sync_fetch_and_or, |)
++RECOMP_RMW_DEF(xor, 8, uint8_t, __sync_fetch_and_xor, ^)
++RECOMP_RMW_DEF(xor, 16, uint16_t, __sync_fetch_and_xor, ^)
++RECOMP_RMW_DEF(xor, 32, uint32_t, __sync_fetch_and_xor, ^)
++#endif
++
+ #include <setjmp.h>
+ jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
+ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+diff --git a/tools/recomp/test_rmw_shared.py b/tools/recomp/test_rmw_shared.py
+new file mode 100644
+--- /dev/null
++++ b/tools/recomp/test_rmw_shared.py
+@@ -0,0 +1,62 @@
++"""Unlocked read-modify-write instructions on shared memory lift as one atomic step.
++
++On the console's one CPU `dec dword [refcount]` cannot be split by a thread
++switch, so titles leave it unlocked. Lifted as load, store and read-back, two
++threads could both see zero and both free the object.
++"""
++import unittest
++
++from .disasm import BasicBlock, Instruction, Operand
++from .lifter import Lifter, lift_basic_block
++
++
++def _mem(base="ecx", size=4):
++    return Operand(type="mem", mem_base=base, mem_index=None, mem_scale=1, mem_disp=4, mem_size=size)
++
++
++def _lift(mnemonic, ops):
++    insn = Instruction(0, 3, mnemonic, "", "00")
++    insn.operands = ops
++    lifted, _ = lift_basic_block(Lifter(), BasicBlock(start=0, instructions=[insn]))
++    return chr(10).join(lifted)
++
++
++class RmwSharedTest(unittest.TestCase):
++    def test_dec_is_one_step_and_flags_come_from_the_old_value(self):
++        out = _lift("dec", [_mem()])
++        self.assertIn("recomp_rmw_add32(ecx + 4, 0u - 1u)", out)
++        self.assertIn("_fa = (uint32_t)(_o - 1u) & 0xFFFFFFFFu", out)
++        self.assertNotIn("MEM32", out)      # no read-back another thread could change
++
++    def test_inc_byte_uses_the_byte_form(self):
++        out = _lift("inc", [_mem(size=1)])
++        self.assertIn("recomp_rmw_add8(ecx + 4, 1u)", out)
++        self.assertIn("_fa = (uint32_t)(_o + 1u) & 0xFFu", out)
++
++    def test_alu_forms(self):
++        reg = Operand(type="reg", reg="eax")
++        self.assertIn("recomp_rmw_add32(ecx + 4, _s)", _lift("add", [_mem(), reg]))
++        self.assertIn("recomp_rmw_add32(ecx + 4, 0u - _s)", _lift("sub", [_mem(), reg]))
++        self.assertIn("recomp_rmw_and32(ecx + 4, _s)", _lift("and", [_mem(), reg]))
++        self.assertIn("recomp_rmw_or32(ecx + 4, _s)", _lift("or", [_mem(), reg]))
++        self.assertIn("recomp_rmw_xor32(ecx + 4, _s)", _lift("xor", [_mem(), reg]))
++
++    def test_not_has_no_flags(self):
++        out = _lift("not", [_mem(size=2)])
++        self.assertIn("recomp_rmw_xor16(ecx + 4, 0xFFFFFFFFu)", out)
++        self.assertNotIn("_fa", out)
++
++    def test_own_stack_stays_plain(self):
++        self.assertNotIn("recomp_rmw", _lift("dec", [_mem(base="esp")]))
++
++    def test_tib_stays_plain(self):
++        op = _mem()
++        op.mem_seg = "fs"
++        self.assertNotIn("recomp_rmw", _lift("dec", [op]))
++
++    def test_registers_stay_plain(self):
++        self.assertNotIn("recomp_rmw", _lift("dec", [Operand(type="reg", reg="eax")]))
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,80 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index b708211..149553c 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -47,6 +47,18 @@
+ #define NV_TLS __thread
+ #endif
+ 
++/* Where the executor's time goes (QPC ticks; the GPU back end's stats line
++ * reads and resets them): all of raster_batch, the vertex loop of program
++ * batches (attribute fetch + interpreter), the interpreter alone, clip and
++ * triangle assembly, and the hand-off to the back end. */
++unsigned long long g_pb_t_batch, g_pb_t_xf, g_pb_t_vsh, g_pb_t_clip, g_pb_t_flush;
++unsigned g_pb_n_xfverts;
++#if defined(_WIN32)
++static unsigned long long pb_ticks(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return (unsigned long long)t.QuadPart; }
++#else
++static unsigned long long pb_ticks(void) { return 0; }
++#endif
++
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+ extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+ extern void xbox_FramebufferWindowSetAA(uint32_t sy);
+@@ -2990,8 +3002,13 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+         else
+             fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+     }
+-    if (!nv2a_vsh_run((const float (*)[4])in, out))
+-        return 0;
++    {
++        unsigned long long t0 = pb_ticks();
++        int ok = nv2a_vsh_run((const float (*)[4])in, out);
++        g_pb_t_vsh += pb_ticks() - t0;
++        if (!ok)
++            return 0;
++    }
+     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
+      * are already surface units. The hardware draws such a vertex (xemu
+      * clamps w away from zero, in front of the eye), but raster_xf_clipped
+@@ -3018,12 +3035,18 @@ static void xf_set_viewport(void)
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
++    unsigned long long t0, t1;
+ 
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
++    t0 = pb_ticks();
+     for (i = 0; i < n; i++)
+         if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) { g_dbg_xffail++;
++            g_pb_t_xf += pb_ticks() - t0;
+             return; }                                    /* no program loaded */
++    t1 = pb_ticks();
++    g_pb_t_xf += t1 - t0;
++    g_pb_n_xfverts += n;
+     xf_set_viewport();
+     {
+         const VertexAttr *tc = texcoord_attr();
+@@ -3153,8 +3176,11 @@ static void raster_batch_program(void)
+     }
+     /* The batch's triangles, all at once (see xf_queue_push). */
+     xf_queue_flush();
++    t0 = pb_ticks();
++    g_pb_t_clip += t0 - t1;
+     if (backend_draws())
+         backend_flush(!s_xf_no_tex);
++    g_pb_t_flush += pb_ticks() - t0;
+ }
+ 
+ static void raster_batch(void)
+@@ -3323,7 +3349,9 @@ static void draw_primitive(void)
+     {
+         uint32_t t0 = s_gpu.tris_drawn;
+         uint64_t p0 = s_gpu.pixels;
++        unsigned long long tb = pb_ticks();
+         raster_batch();
++        g_pb_t_batch += pb_ticks() - tb;
+         if (s_ftrace == 2) {
+             fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
+                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"

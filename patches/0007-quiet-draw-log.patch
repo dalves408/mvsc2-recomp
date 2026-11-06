@@ -1,0 +1,20 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 149553c..dbccd0e 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3326,8 +3326,13 @@ static void draw_primitive(void)
+     if (!s_gpu.prim || !s_gpu.idx_count) { g_dbg_dpn++; return; }
+     g_dbg_dp++;
+     s_gpu.draws++;
+-    if ((s_gpu.draws % 200) == 0)
+-        fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
++    {   /* Was unconditional: ~7,500 lines per 170 s fight run, the bulk of all stderr. */
++        static int vdraws = -1;
++        if (vdraws < 0)
++            vdraws = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
++        if (vdraws && (s_gpu.draws % 200) == 0)
++            fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
++    }
+     s_gpu.verts += s_gpu.idx_count;
+ 
+     /* How many batches carry coordinates at all, and what range they span.

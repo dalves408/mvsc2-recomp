@@ -1,0 +1,464 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -3340,9 +3340,20 @@ static void kernel_vblank_raise(void)
+  * edge, 0 when vblanks are off. */
+ #define VBLANK_RESTART_NS 100000000ull
+ 
++/* The rate of the emulated display. xbox_set_vblank_hz() changes it while running. */
++static volatile unsigned s_vblank_hz = 60;
++static volatile int s_vblank_restart;
++
++void xbox_set_vblank_hz(unsigned hz)
++{
++    if (hz < 30) hz = 30;
++    if (hz > 1000) hz = 1000;
++    if (hz != s_vblank_hz) { s_vblank_hz = hz; s_vblank_restart = 1; }
++}
++
+ static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
+ {
+-    return t0_ns + n * 1000000000ull / 60u;
++    return t0_ns + n * 1000000000ull / s_vblank_hz;
+ }
+ 
+ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+@@ -3359,6 +3370,11 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+         t0_ns = now_ns;
+         count = 0;
+     }
++    if (s_vblank_restart) {
++        s_vblank_restart = 0;
++        t0_ns = now_ns;
++        count = 0;
++    }
+     due = vblank_due(t0_ns, count);
+     if (now_ns < due) {
+         *next_due_ns = due;
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -62,6 +62,7 @@ static unsigned long long pb_ticks(void) { return 0; }
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+ extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+ extern void xbox_FramebufferWindowSetAA(uint32_t sy);
++volatile uint32_t g_nv2a_flip_va;   /* the surface this flip shows, for a back end that presents it itself */
+ extern uint32_t xbox_Nv2aFenceWordVa(void);
+ extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c: RECOMP_PB_WALK=dma */
+ extern void xbox_FramebufferWindowStart(void);
+@@ -4248,6 +4249,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             draws_at_flip = s_gpu.draws;
+         }
+         /* A back end puts its frame into guest memory here, before the window copies it. */
++        {
++            extern volatile uint32_t g_nv2a_flip_va;
++            uint32_t shown = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
++            g_nv2a_flip_va = shown ? dma_resolve(shown) : 0;
++        }
+         if (s_backend && s_backend->flip)
+             s_backend->flip();
+         if (s_gpu.pitch) {
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -636,6 +636,12 @@ static int usb_gamepad_report_raw(int pad, uint8_t *out, int max)
+  * flood the log), plus the first report. Layout:
+  *   id len | buttons(dpad,start,back,L3,R3) reserved | A B X Y Black White LT RT |
+  *   LX LY RX RY (16-bit LE) */
++/* While a title's own overlay is open every pad reports nothing pressed, so the game cannot be steered
++ * from behind it. Back + Start on controller 1 is the overlay's: that Start is hidden from the game when
++ * xbox_input_back_start is set. */
++volatile int xbox_input_block;
++volatile int xbox_input_back_start;
++
+ int usb_gamepad_report(int pad, uint8_t *out, int max)
+ {
+     static int dbg = -1;
+@@ -645,6 +651,10 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+     static unsigned long nrep[USB_GAMEPAD_MAX];
+     int n = usb_gamepad_report_raw(pad, out, max);
+ 
++    if (xbox_input_block && n == 20)
++        memset(out + 2, 0, 18);
++    else if (xbox_input_back_start && pad == 0 && n >= 3 && (out[2] & 0x20))
++        out[2] &= (uint8_t)~0x10;
+     if (dbg < 0) {
+         const char *e = getenv("RECOMP_PAD_DEBUG");
+         dbg = e && *e && *e != '0';
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -1142,12 +1142,24 @@ static void apu_irq_stats_line(void)
+     s_irq_next_ns = now + 5000000000ull;
+ }
+ 
++/* A title's overlay holds the sound here while the game is paused: voices keep their place. */
++volatile int xbox_apu_hold;
++
+ static void *mcpx_apu_frame_thread(void *arg)
+ {
+     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+     qemu_mutex_lock(&d->lock);
+ 
+     while (!qatomic_read(&d->exiting)) {
++        if (xbox_apu_hold) {
++            if (xa2_is_active())
++                xa2_expect_drain();     /* a pause, not an underrun */
++            qemu_mutex_unlock(&d->lock);
++            Sleep(5);
++            qemu_mutex_lock(&d->lock);
++            hs_rebase();
++            continue;
++        }
+         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+             d->is_idle = true;
+             if (xa2_is_active())
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -162,6 +162,13 @@ void xa2_shutdown(void)
+     g_xa2_initialized = 0;
+ }
+ 
++/* Silence the output while a title's overlay has the game paused. */
++void xa2_set_muted(int muted)
++{
++    if (g_xa2_master)
++        g_xa2_master->lpVtbl->SetVolume(g_xa2_master, muted ? 0.0f : 1.0f, 0);
++}
++
+ int xa2_is_active(void)
+ {
+     return g_xa2_initialized;
+diff --git a/src/video/gpu_present.h b/src/video/gpu_present.h
+--- a/src/video/gpu_present.h
++++ b/src/video/gpu_present.h
+@@ -11,6 +11,13 @@ int  gpu_present_init(HWND hwnd, uint32_t width, uint32_t height);
+  * (so the caller need not sleep), 0 when unpaced or nothing was shown. */
+ int  gpu_present_frame(const uint32_t *pixels);
+ int  gpu_present_active(void);
++/* A render back end on another device hands over its frame in a shared, keyed-mutex texture. NULL goes back to
++ * uploading the pixels given to gpu_present_frame. Any thread. */
++void gpu_present_set_source(void *shared_handle, uint32_t width, uint32_t height);
++void gpu_present_frame_ready(void);
++void gpu_present_set_vsync(int on);
++void gpu_present_set_stretch(int on);       /* fill the window instead of keeping the frame's shape */
++int  gpu_present_idle_ms(void);             /* how long the window loop waits when nothing was shown */
+ void gpu_present_shutdown(void);
+ #endif
+ #endif
+diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
+--- a/src/video/gpu_present.c
++++ b/src/video/gpu_present.c
+@@ -35,18 +35,82 @@ static ID3D11ShaderResourceView *s_srv;
+ static ID3D11SamplerState       *s_samp;
+ static ID3D11VertexShader       *s_vs;
+ static ID3D11PixelShader        *s_ps;
++static ID3D11Buffer             *s_cb;
++/* The shared frame of a render back end: requested from its thread, opened on the window's. */
++static void * volatile           s_src_handle;
++static volatile uint32_t         s_src_w, s_src_h;
++static volatile LONG             s_src_gen, s_src_open_gen, s_src_serial;
++static LONG                      s_src_shown = -1;
++static ID3D11Texture2D          *s_src_tex;
++static ID3D11ShaderResourceView *s_src_srv;
++static IDXGIKeyedMutex          *s_src_mutex;
++static uint32_t                  s_src_tw, s_src_th;
++static volatile int              s_stretch;
+ static HWND                      s_hwnd;
+ static uint32_t                  s_w, s_h;      /* frame size */
+ static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
+-static int                       s_vsync = 1;
++static volatile int              s_vsync = 1;
+ 
+-/* A triangle covering the viewport, from the vertex id; uv 0..1. */
++/* A triangle covering the viewport, from the vertex id; uv 0..1. A frame larger than the viewport is
++ * averaged over the source pixels each output pixel covers (src = size, source pixels per output pixel):
++ * one tap would throw most of a high render scale away. At or above its own size it is one tap. */
+ static const char s_hlsl[] =
+     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
++    "cbuffer C : register(b0) { float4 src; };\n"
+     "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+     "V vs(uint i : SV_VertexID) { V o; float2 q = float2((i << 1) & 2, i & 2);\n"
+     "  o.uv = q; o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+-    "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
++    "float4 ps(V i) : SV_Target {\n"
++    "  float2 r = max(src.zw, 1.0);\n"
++    "  int nx = (int)min(ceil(r.x), 8.0), ny = (int)min(ceil(r.y), 8.0);\n"
++    "  float3 sum = 0; float2 c = i.uv * src.xy;\n"
++    "  for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {\n"
++    "    float2 o = ((float2(x, y) + 0.5) / float2(nx, ny) - 0.5) * r;\n"
++    "    sum += t.Sample(s, (c + o) / src.xy).rgb; }\n"
++    "  return float4(sum / (nx * ny), 1); }\n";
++
++void gpu_present_set_source(void *shared_handle, uint32_t width, uint32_t height)
++{
++    s_src_handle = shared_handle;
++    s_src_w = width;
++    s_src_h = height;
++    InterlockedIncrement(&s_src_gen);
++}
++
++void gpu_present_frame_ready(void) { InterlockedIncrement(&s_src_serial); }
++void gpu_present_set_vsync(int on) { s_vsync = on != 0; }
++void gpu_present_set_stretch(int on) { s_stretch = on != 0; }
++int  gpu_present_idle_ms(void) { return s_src_handle && !s_vsync ? 1 : 16; }
++
++static void source_close(void)
++{
++    if (s_src_mutex) { IDXGIKeyedMutex_Release(s_src_mutex); s_src_mutex = NULL; }
++    if (s_src_srv)   { ID3D11ShaderResourceView_Release(s_src_srv); s_src_srv = NULL; }
++    if (s_src_tex)   { ID3D11Texture2D_Release(s_src_tex); s_src_tex = NULL; }
++}
++
++/* On the window's thread: follow a change of the shared frame. Failing leaves the pixel upload. */
++static void source_follow(void)
++{
++    LONG gen = s_src_gen;
++    void *handle = s_src_handle;
++    if (gen == s_src_open_gen)
++        return;
++    s_src_open_gen = gen;
++    source_close();
++    if (!handle)
++        return;
++    if (FAILED(ID3D11Device_OpenSharedResource(s_dev, (HANDLE)handle, &IID_ID3D11Texture2D, (void **)&s_src_tex))
++        || FAILED(ID3D11Texture2D_QueryInterface(s_src_tex, &IID_IDXGIKeyedMutex, (void **)&s_src_mutex))
++        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_src_tex, NULL, &s_src_srv))) {
++        fprintf(stderr, "  [D3D] could not open the render back end's frame; using the guest's pixels\n");
++        source_close();
++        return;
++    }
++    s_src_tw = s_src_w;
++    s_src_th = s_src_h;
++    s_src_shown = -1;
++}
+ 
+ int gpu_present_enabled(void)
+ {
+@@ -145,7 +209,14 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+     smp.MaxLOD = D3D11_FLOAT32_MAX;
+     vsb = compile("vs", "vs_4_0");
+     psb = compile("ps", "ps_4_0");
+-    if (!vsb || !psb || !make_rtv()
++    {
++        D3D11_BUFFER_DESC bd;
++        ZeroMemory(&bd, sizeof bd);
++        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb);
++    }
++    if (!vsb || !psb || !s_cb || !make_rtv()
+         || FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_frame))
+         || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_frame, NULL, &s_srv))
+         || FAILED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_samp))
+@@ -167,6 +238,50 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+     return 1;
+ }
+ 
++/* RECOMP_PRESENT_SHOT=<path>: when <path>.req exists, the next back buffer goes to <path>.bmp and the request is
++ * removed. Screen capture cannot see a window Windows has given direct flip, and this shows what was really presented. */
++static void shot_poll(void)
++{
++    static int checked;
++    static const char *path;
++    char req[MAX_PATH], bmp[MAX_PATH];
++    ID3D11Texture2D *back = NULL, *st = NULL;
++    D3D11_TEXTURE2D_DESC td;
++    D3D11_MAPPED_SUBRESOURCE m;
++
++    if (!checked) { checked = 1; path = getenv("RECOMP_PRESENT_SHOT"); }
++    if (!path) return;
++    snprintf(req, sizeof req, "%s.req", path);
++    if (GetFileAttributesA(req) == INVALID_FILE_ATTRIBUTES) return;
++    snprintf(bmp, sizeof bmp, "%s.bmp", path);
++    if (SUCCEEDED(IDXGISwapChain_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D, (void **)&back))) {
++        ID3D11Texture2D_GetDesc(back, &td);
++        td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
++        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) {
++            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)back);
++            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
++                FILE *f = fopen(bmp, "wb");
++                if (f) {
++                    BITMAPFILEHEADER fh;
++                    BITMAPINFOHEADER ih;
++                    uint32_t y;
++                    memset(&fh, 0, sizeof fh); memset(&ih, 0, sizeof ih);
++                    fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + td.Width * td.Height * 4;
++                    ih.biSize = sizeof ih; ih.biWidth = (LONG)td.Width; ih.biHeight = -(LONG)td.Height; ih.biPlanes = 1; ih.biBitCount = 32;
++                    fwrite(&fh, sizeof fh, 1, f); fwrite(&ih, sizeof ih, 1, f);
++                    for (y = 0; y < td.Height; y++)
++                        fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, td.Width, 4, f);
++                    fclose(f);
++                }
++                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
++            }
++            ID3D11Texture2D_Release(st);
++        }
++        ID3D11Texture2D_Release(back);
++    }
++    DeleteFileA(req);
++}
++
+ /* Returns 0 when nothing was shown: the window is occluded or the display
+  * is off, and Present does not wait for vsync then -- the caller must pace
+  * itself instead of spinning. The pixels are read before this returns. */
+@@ -174,12 +289,22 @@ int gpu_present_frame(const uint32_t *pixels)
+ {
+     static const float black[4] = {0, 0, 0, 1};
+     D3D11_VIEWPORT vp;
+-    uint32_t cw, ch;
++    uint32_t cw, ch, fw, fh;
+     float sx, sy;
++    int use_src, resized = 0;
++    LONG serial = s_src_serial;
++    ID3D11ShaderResourceView *show;
++    D3D11_MAPPED_SUBRESOURCE m;
+ 
+     if (!s_rtv || !pixels)
+         return 0;
++    source_follow();
++    use_src = s_src_srv != NULL;
+     client_size(&cw, &ch);
++    resized = cw != s_bw || ch != s_bh;
++    /* With no wait for the display, a frame already shown is not shown again. */
++    if (use_src && !s_vsync && !resized && serial == s_src_shown)
++        return 0;
+     if (cw != s_bw || ch != s_bh) {
+         /* The window was resized (or went fullscreen): a back buffer its size. */
+         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+@@ -190,15 +315,19 @@ int gpu_present_frame(const uint32_t *pixels)
+             return 0;
+         s_bw = cw; s_bh = ch;
+     }
+-    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
+-                                          pixels, s_w * 4, 0);
++    if (!use_src)
++        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
++                                              pixels, s_w * 4, 0);
++    show = use_src ? s_src_srv : s_srv;
++    fw = use_src ? s_src_tw : s_w;
++    fh = use_src ? s_src_th : s_h;
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
+     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
+     /* The largest rectangle of the frame's shape that fits, centred. */
+-    sx = (float)s_bw / (float)s_w;
+-    sy = (float)s_bh / (float)s_h;
+-    vp.Width = (float)s_w * (sx < sy ? sx : sy);
+-    vp.Height = (float)s_h * (sx < sy ? sx : sy);
++    sx = (float)s_bw / (float)fw;
++    sy = (float)s_bh / (float)fh;
++    vp.Width = s_stretch ? (float)s_bw : (float)fw * (sx < sy ? sx : sy);
++    vp.Height = s_stretch ? (float)s_bh : (float)fh * (sx < sy ? sx : sy);
+     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
+     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
+     vp.MinDepth = 0; vp.MaxDepth = 1;
+@@ -207,9 +336,27 @@ int gpu_present_frame(const uint32_t *pixels)
+     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_srv);
++    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
++        float *c = (float *)m.pData;
++        c[0] = (float)fw; c[1] = (float)fh; c[2] = (float)fw / vp.Width; c[3] = (float)fh / vp.Height;
++        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
++    }
++    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
++    if (use_src && FAILED(IDXGIKeyedMutex_AcquireSync(s_src_mutex, 0, 50)))
++        return 0;                       /* the back end has it: the next pass shows it */
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &show);
+     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_samp);
+     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
++    {
++        ID3D11ShaderResourceView *none = NULL;
++        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
++    }
++    if (use_src) {
++        ID3D11DeviceContext_Flush(s_ctx);
++        IDXGIKeyedMutex_ReleaseSync(s_src_mutex, 0);
++        s_src_shown = serial;
++    }
++    shot_poll();
+     /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
+      * the caller keeps its own 16 ms sleep instead of spinning a core. */
+     return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
+@@ -217,6 +364,8 @@ int gpu_present_frame(const uint32_t *pixels)
+ 
+ void gpu_present_shutdown(void)
+ {
++    source_close();
++    if (s_cb)    { ID3D11Buffer_Release(s_cb);                s_cb = NULL; }
+     if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
+     if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
+     if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -227,6 +227,15 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+ void (*xbox_fb_fullscreen_changed)(int fullscreen);
+ static int s_fb_full;
+ 
++/* A title's own overlay: keys first (return 1 to keep one from the game), and a call per window pass,
++ * both on the window's thread. */
++int  (*xbox_fb_key_hook)(unsigned vk, long lparam, int down);
++void (*xbox_fb_tick_hook)(void);
++static HWND s_fb_hwnd;
++
++HWND xbox_fb_window(void) { return s_fb_hwnd; }
++int  xbox_fb_is_fullscreen(void) { return s_fb_full; }
++
+ /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+  * gpu_present.c; both presenters letterbox to any size.) */
+@@ -254,8 +263,25 @@ static void fb_toggle_fullscreen(HWND h)
+     }
+ }
+ 
++/* On the window's thread: switch as F11 does, and say so. */
++void xbox_fb_toggle_fullscreen(void)
++{
++    if (!s_fb_hwnd)
++        return;
++    fb_toggle_fullscreen(s_fb_hwnd);
++    if (xbox_fb_fullscreen_changed)
++        xbox_fb_fullscreen_changed(s_fb_full);
++}
++
+ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
++    if (xbox_fb_key_hook && (m == WM_KEYDOWN || m == WM_SYSKEYDOWN || m == WM_KEYUP || m == WM_SYSKEYUP)
++        && xbox_fb_key_hook((unsigned)w, (long)l, m == WM_KEYDOWN || m == WM_SYSKEYDOWN))
++        return 0;
++    if (m == WM_SETCURSOR && s_fb_full && LOWORD(l) == HTCLIENT) {  /* no mouse pointer over a fullscreen game */
++        SetCursor(NULL);
++        return TRUE;
++    }
+     /* First press only (bit 30: the key was already down), and with Alt held
+      * (bit 29) for Enter; neither reaches the key table. */
+     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
+@@ -530,6 +556,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+         return 0;
+     }
+     hdc = GetDC(hwnd);
++    s_fb_hwnd = hwnd;
+     {
+         const char *fs = getenv("RECOMP_FULLSCREEN");
+         if (fs && *fs && *fs != '0')
+@@ -560,6 +587,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             TranslateMessage(&msg);
+             DispatchMessageA(&msg);
+         }
++        if (xbox_fb_tick_hook)
++            xbox_fb_tick_hook();
+         if (s_present_idx >= 0 && s_rgb) {
+             /* A finished frame, published by the flip. Copied into s_rgb so
+              * the dump path and GDI see one consistent image even if the
+@@ -623,7 +652,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             }
+         }
+         if (!paced)
+-            Sleep(16);                  /* D3D11's Present waited for vsync */
++            Sleep(gpu_present_active() ? gpu_present_idle_ms() : 16);   /* D3D11's Present waited for vsync */
+     }
+ 
+     gpu_present_shutdown();

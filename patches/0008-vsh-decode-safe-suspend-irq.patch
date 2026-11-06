@@ -1,0 +1,552 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 7746ae3..0b8dc4d 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -315,6 +315,26 @@ static void apu_deliver_irq(MCPXAPUState *d)
+         tib_ready = 1;
+     }
+ 
++    /* A guest thread above DISPATCH_LEVEL masks the interrupt, as on the console: wait for it to lower, however
++     * long (the line is level-triggered; the frame thread polls again). Only a raise that never ends lets it through,
++     * after ~10 s, with a warning. RECOMP_APU_DIRQL_WAIT=0 restores the old behaviour (DISPATCH hold-off only). */
++    {
++        extern int xbox_IrqlBlocksDeviceInterrupts(void);
++        static int on = -1;
++        static unsigned waits, warned;
++        static volatile LONG held_total;
++        if (on < 0) { const char *e = getenv("RECOMP_APU_DIRQL_WAIT"); on = !(e && e[0] == '0'); }
++        if (on && xbox_IrqlBlocksDeviceInterrupts()) {
++            LONG n = InterlockedIncrement(&held_total);
++            if (n == 1 || (n % 1000) == 0)
++                fprintf(stderr, "  [IRQ] apu ISR held: a guest thread is above DISPATCH_LEVEL (%ld times so far)\n", (long)n);
++            if (++waits < 10000)
++                return;                      /* d->lock is still held: we have not dropped it yet */
++            if (!warned++)
++                fprintf(stderr, "  [IRQ] apu ISR delivered after ~10 s of a raise above DISPATCH (leaked raise?)\n");
++        }
++        waits = 0;
++    }
+     qemu_mutex_unlock(&d->lock);
+     xbox_IrqSetHandler(XBOX_IRQ_APU, apu_isr_on_holder);
+     /* The one-CPU gate (xbox_DispatchGateTryEnter): with it, no thread at
+diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
+index 235140f..68dc370 100644
+--- a/src/apu/apu_mmio_hook.c
++++ b/src/apu/apu_mmio_hook.c
+@@ -102,7 +102,10 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+      * a title that waits on one waits forever, and the only way to work out
+      * what it is waiting for is to see the register traffic that precedes the
+      * wait. */
+-    if (apu_env_on("RECOMP_APU_TRACE")) {
++    static int trace = -1;   /* read once: getenv on every MMIO access took the CRT environment lock each time */
++    if (trace < 0)
++        trace = apu_env_on("RECOMP_APU_TRACE");
++    if (trace) {
+         static unsigned n;
+         if (n++ < 400) {
+             /* The value as well as the offset: finding which register carries
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index ec8de0b..7b56aba 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -709,6 +709,8 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
+ 
+ void guest_cpu_join(void);
+ void guest_cpu_part(void);
++void xbox_HostCodeEnter(void);          /* deferred guest suspension: see bridge_NtSuspendThread */
++void xbox_HostCodeLeave(int park);
+ 
+ static DWORD WINAPI bridge_thread_main(LPVOID param)
+ {
+@@ -723,6 +725,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+      * for every thread, which is how two of them ended up inside _lock() each
+      * holding the lock the other wanted. */
+     g_is_spawned_thread = 1;
++    xbox_HostCodeEnter();   /* startup is host code: a guest suspend waits for bridge_run_thread_inline */
+     g_esp = s->stack_top;
+     g_thread_stack_top = s->stack_top;
+     g_thread_obj_va = s->obj_va;
+@@ -751,6 +754,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+     xbox_DpcMarkGuestThread();
+     xbox_GuestThreadPin("guest-worker");
+     guest_cpu_join();
++    xbox_HostCodeLeave(1);
+     bridge_run_thread_inline(fn, ctx1, ctx2);
+     guest_cpu_part();
+ 
+@@ -5750,13 +5754,110 @@ static void bridge_NtReleaseMutant(void)
+  * does that on a worker, and the "suspended" thread spun through 289 million
+  * kernel calls while the title thought it was idle.
+  */
++/* ── Guest-requested suspension, deferred out of host code ─────────────────
++ *
++ * The title suspends its own threads (MvC2's worker, sub_0020E6B9 ->
++ * NtSuspendThread). SuspendThread stops a thread wherever it is; caught in
++ * host code holding a CRT lock (getenv's environment lock, the heap, a stream),
++ * it took that lock with it, and the next thread to want it blocked for good:
++ * a boot or load hang with the audio ISR, thread creation and a new thread's
++ * startup all inside getenv ([FREEZE] dumps, gated runs gh3/gh10). Guest code
++ * holds no host locks, so suspending a thread there is safe. Each guest thread
++ * counts how deep it is in host code (its startup, every kernel call, every
++ * MMIO trap): a suspend that finds it inside host code resumes it and leaves
++ * the suspend pending; the thread parks itself (on its slot's event, holding
++ * nothing) as it leaves host code. A resume cancels a pending suspend, wakes a
++ * parked thread, or resumes a real one. RECOMP_RAW_SUSPEND=1 suspends at once,
++ * as before. */
++typedef struct {
++    volatile LONG tid, host, pend, parked;
++    HANDLE evt;
++} SuspSlot;
++#define SUSP_SLOTS 256
++static SuspSlot s_susp[SUSP_SLOTS];
++static __declspec(thread) SuspSlot *t_susp;
++
++static int susp_raw(void)
++{
++    static int raw = -1;
++    if (raw < 0) raw = getenv("RECOMP_RAW_SUSPEND") != NULL;
++    return raw;
++}
++
++static SuspSlot *susp_find(DWORD tid, int create)
++{
++    int i;
++    for (i = 0; i < SUSP_SLOTS; i++)
++        if (s_susp[i].tid == (LONG)tid)
++            return &s_susp[i];
++    if (!create)
++        return NULL;
++    for (i = 0; i < SUSP_SLOTS; i++)
++        if (InterlockedCompareExchange(&s_susp[i].tid, (LONG)tid, 0) == 0) {
++            s_susp[i].host = s_susp[i].pend = s_susp[i].parked = 0;
++            if (!s_susp[i].evt)
++                s_susp[i].evt = CreateEventA(NULL, FALSE, FALSE, NULL);
++            return &s_susp[i];
++        }
++    return NULL;
++}
++
++static void susp_park_if_pending(SuspSlot *s)
++{
++    for (;;) {
++        LONG p = s->pend;
++        if (p <= 0)
++            return;
++        if (InterlockedCompareExchange(&s->pend, p - 1, p) == p)
++            break;
++    }
++    InterlockedIncrement(&s->parked);
++    while (InterlockedCompareExchange(&s->parked, 0, 0) > 0)
++        WaitForSingleObject(s->evt, 50);
++}
++
++/* Around host code a guest thread runs: startup, kernel calls, MMIO traps.
++ * park = 0 where parking is not allowed (inside exception dispatch). */
++void xbox_HostCodeEnter(void)
++{
++    SuspSlot *s = t_susp;
++    if (!s && (s = susp_find(GetCurrentThreadId(), 1)) != NULL)
++        t_susp = s;
++    if (s)
++        InterlockedIncrement(&s->host);
++}
++
++void xbox_HostCodeLeave(int park)
++{
++    SuspSlot *s = t_susp;
++    if (s && InterlockedDecrement(&s->host) == 0 && park)
++        susp_park_if_pending(s);
++}
++
+ static void bridge_NtSuspendThread(void)
+ {
+     uint32_t count_va = STACK_ARG(1);
+-
++    HANDLE rh = bridge_resolve_handle(STACK_ARG(0));
++    DWORD tid = rh ? GetThreadId(rh) : 0;
++    SuspSlot *s = (tid && tid != GetCurrentThreadId() && !susp_raw()) ? susp_find(tid, 0) : NULL;
++
++    if (s) {
++        DWORD prev = SuspendThread(rh);
++        if (prev != (DWORD)-1) {
++            ULONG before = (ULONG)prev + (ULONG)s->pend + (ULONG)s->parked;
++            if (InterlockedCompareExchange(&s->host, 0, 0) > 0) {
++                /* In host code: let it run out of there, then park. */
++                InterlockedIncrement(&s->pend);
++                ResumeThread(rh);
++            }
++            if (count_va)
++                BRIDGE_MEM32(count_va) = before;
++            g_eax = 0;
++            return;
++        }
++    }
+     {
+         static int dbg = 0;
+-        HANDLE rh = bridge_resolve_handle(STACK_ARG(0));
+         g_eax = (uint32_t)xbox_NtSuspendThread(rh,
+             count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+         if (g_eax && dbg++ < 20)
+@@ -5768,9 +5869,29 @@ static void bridge_NtSuspendThread(void)
+ /* ── NtResumeThread (ordinal 224, 2 args) */
+ static void bridge_NtResumeThread(void)
+ {
+-    g_eax = (uint32_t)xbox_NtResumeThread(
+-        bridge_resolve_handle(STACK_ARG(0)),
+-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
++    HANDLE rh = bridge_resolve_handle(STACK_ARG(0));
++    uint32_t count_va = STACK_ARG(1);
++    DWORD tid = rh ? GetThreadId(rh) : 0;
++    SuspSlot *s = (tid && !susp_raw()) ? susp_find(tid, 0) : NULL;
++
++    if (s) {
++        LONG p;
++        while ((p = s->pend) > 0)                     /* a suspend not yet taken effect */
++            if (InterlockedCompareExchange(&s->pend, p - 1, p) == p) {
++                if (count_va) BRIDGE_MEM32(count_va) = (uint32_t)(p + s->parked);
++                g_eax = 0;
++                return;
++            }
++        while ((p = s->parked) > 0)                   /* a parked thread */
++            if (InterlockedCompareExchange(&s->parked, p - 1, p) == p) {
++                SetEvent(s->evt);
++                if (count_va) BRIDGE_MEM32(count_va) = (uint32_t)p;
++                g_eax = 0;
++                return;
++            }
++    }
++    g_eax = (uint32_t)xbox_NtResumeThread(rh,
++        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+ }
+ 
+ /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
+@@ -10918,13 +11039,18 @@ void guest_cpu_part(void)
+  * APC, an unwind handler) makes its own kernel calls through here too: they
+  * find the CPU as the bridge's callback entry left it and restore that, so
+  * the routine returns into the bridge holding what it held. */
++void xbox_HostCodeEnter(void);
++void xbox_HostCodeLeave(int park);
+ static void kernel_thunk_dispatch(void)
+ {
+     int slot = g_kernel_dispatch_slot;
+-    int held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL,
+-                                    slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+-                                    ? g_slot_ordinals[slot] : 0);
++    int held;
++    xbox_HostCodeEnter();   /* a guest suspend waits until this call is done (bridge_NtSuspendThread) */
++    held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL,
++                                slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
++                                ? g_slot_ordinals[slot] : 0);
+     kernel_thunk_dispatch_body();
++    xbox_HostCodeLeave(1);  /* parks here, holding nothing, if a suspend came in meanwhile */
+     if (held)
+         xbox_GuestCpuAcquire();
+ }
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index a396541..6481bc2 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -834,10 +834,33 @@ void xbox_IrqReport(void)
+     fflush(stderr);
+ }
+ 
++/* Guest threads raised ABOVE DISPATCH_LEVEL by their own raise (a device level, SYNCH, HIGH): the level at which
++ * the console masks device interrupts. DISPATCH alone does not mask them, so the DISPATCH count above is the wrong
++ * test for "may an ISR run now": a device model that held its ISR off at DISPATCH for 50 polls and then delivered it
++ * anyway also delivered it beside a thread at the device level, inside the structures it raised to protect
++ * (DirectSound list corruption -> wild call -> crash, mash1 runs). A host thread's own ISR bracket
++ * (xbox_IrqlEnterInterrupt) is not counted. */
++static volatile LONG g_irql_high_count;
++static XBOX_THREAD_LOCAL int t_high_counted, t_isr_depth;
++int xbox_IrqlBlocksDeviceInterrupts(void)
++{
++    return InterlockedCompareExchange(&g_irql_high_count, 0, 0) != 0;
++}
++static void irql_track_high(KIRQL new_level)
++{
++    int now = new_level > DISPATCH_LEVEL && t_isr_depth == 0;
++    if (now == t_high_counted)
++        return;
++    t_high_counted = now;
++    if (now) InterlockedIncrement(&g_irql_high_count);
++    else     InterlockedDecrement(&g_irql_high_count);
++}
++
+ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
+                              int gate)
+ {
+     int now = (new_level >= DISPATCH_LEVEL);
++    irql_track_high(new_level);
+     /* With the gate off the count moves on the edge, as it did before the
+      * gate: the hold-off it drives is the one the device models had. */
+     int was = xbox_DispatchGateOn() ? t_irql_counted
+@@ -934,6 +957,8 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+ int xbox_IrqlEnterInterrupt(int level)
+ {
+     int saved = (int)g_current_irql;
++    if (level > DISPATCH_LEVEL)
++        t_isr_depth++;               /* an ISR bracket, not a guest raise (irql_track_high) */
+     if (g_current_irql != (KIRQL)level) {
+         /* A DPC (DISPATCH_LEVEL) goes through the gate; a device ISR does
+          * not (see s_dispatch_gate). */
+@@ -947,6 +972,10 @@ int xbox_IrqlEnterInterrupt(int level)
+ 
+ void xbox_IrqlLeaveInterrupt(int saved)
+ {
++    /* Out of an ISR bracket before the level goes back, so a thread returning to a raised level of its own is
++     * counted again (irql_track_high). */
++    if ((int)g_current_irql > DISPATCH_LEVEL && t_isr_depth > 0)
++        t_isr_depth--;
+     if (g_current_irql != (KIRQL)saved) {
+         irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
+         g_current_irql = (KIRQL)saved;
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c1b48e4..356fa2f 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -37,6 +37,8 @@
+ static uint32_t s_program[NV2A_VSH_SLOTS][4];
+ static float    s_const[NV2A_VSH_CONSTANTS][4];
+ static uint32_t s_load_slot, s_load_word, s_start_slot;
++/* Bumped on every program write, so the decoded copy (nv2a_vsh_run) knows when it is stale. */
++static uint32_t s_prog_gen = 1;
+ static uint32_t s_const_load, s_const_word;
+ static uint32_t s_cxt_write;
+ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
+@@ -65,6 +67,7 @@ void nv2a_vsh_program_word(uint32_t word)
+ {
+     if (s_load_slot < NV2A_VSH_SLOTS)
+         s_program[s_load_slot][s_load_word] = word;
++    s_prog_gen++;
+     if (++s_load_word == 4) {
+         s_load_word = 0;
+         s_load_slot++;
+@@ -116,6 +119,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+ {
+     if (slot < NV2A_VSH_SLOTS)
+         memcpy(s_program[slot], words, sizeof s_program[slot]);
++    s_prog_gen++;
+ }
+ 
+ /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
+@@ -329,7 +333,187 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+     return r;
+ }
+ 
++/* ---- decoded fast path ----------------------------------------------------
++ *
++ * vsh_run_ref below decodes every field of every instruction again for each
++ * vertex (~20 bit-field reads per instruction) and reads all three sources
++ * whatever the op uses. In heavy MvC2 fights that was ~420 ms of every 2 s on
++ * the pushbuffer thread. Here a program is decoded once, from the start slot
++ * to its final instruction, and kept until a program word or the start slot
++ * changes; only the sources an op reads are fetched. The arithmetic is the
++ * same code (run_mac / run_ilu / write_masked). RECOMP_VSH_NODECODE=1 uses
++ * vsh_run_ref; RECOMP_VSH_VERIFY=1 runs both and counts any bitwise
++ * difference ([VSH] verify line every 2^20 vertices). */
++typedef struct { uint8_t neg, mux, reg, sw[4]; } VshSrc;
++typedef struct {
++    uint8_t mac, ilu, mac_mask, ilu_mask, tdst, omask, out_ilu, out_reg, rel, input, end, need;
++    uint16_t oaddr, cidx;
++    VshSrc src[3];
++} VshIns;
++static VshIns   s_dec[NV2A_VSH_SLOTS];
++static uint32_t s_dec_n, s_dec_gen, s_dec_start = 0xFFFFFFFFu;
++
++static void decode_src(const uint32_t *ins, int which, VshSrc *o)
++{
++    uint32_t swz;
++    if (which == 0) {
++        o->neg = (uint8_t)field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
++        o->mux = (uint8_t)field(ins, 2, 26, 2); o->reg = (uint8_t)field(ins, 2, 28, 4);
++    } else if (which == 1) {
++        o->neg = (uint8_t)field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
++        o->mux = (uint8_t)field(ins, 2, 11, 2); o->reg = (uint8_t)field(ins, 2, 13, 4);
++    } else {
++        o->neg = (uint8_t)field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
++        o->mux = (uint8_t)field(ins, 3, 28, 2);
++        o->reg = (uint8_t)((field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2));
++    }
++    o->sw[0] = (uint8_t)((swz >> 6) & 3); o->sw[1] = (uint8_t)((swz >> 4) & 3);
++    o->sw[2] = (uint8_t)((swz >> 2) & 3); o->sw[3] = (uint8_t)(swz & 3);
++}
++
++static void decode_program(void)
++{
++    uint32_t s, n = 0;
++    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
++        const uint32_t *ins = s_program[s];
++        VshIns *d = &s_dec[n++];
++        int k;
++        d->mac = (uint8_t)field(ins, 1, 21, 4); d->ilu = (uint8_t)field(ins, 1, 25, 3);
++        d->mac_mask = (uint8_t)field(ins, 3, 24, 4); d->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
++        d->tdst = (uint8_t)field(ins, 3, 20, 4);
++        d->omask = (uint8_t)field(ins, 3, 12, 4); d->oaddr = (uint16_t)field(ins, 3, 3, 8);
++        d->out_ilu = (uint8_t)field(ins, 3, 2, 1); d->out_reg = (uint8_t)field(ins, 3, 11, 1);
++        d->rel = (uint8_t)field(ins, 3, 1, 1); d->end = (uint8_t)field(ins, 3, 0, 1);
++        d->input = (uint8_t)field(ins, 1, 9, 4); d->cidx = (uint16_t)field(ins, 1, 13, 8);
++        for (k = 0; k < 3; k++) decode_src(ins, k, &d->src[k]);
++        /* Which sources the ops read: A for every MAC op; B for all but mov/add/arl; C for add/mad and the ILU. */
++        d->need = 0;
++        if (d->mac) {
++            d->need |= 1;
++            if (d->mac != 1 && d->mac != 3 && d->mac != 13) d->need |= 2;
++            if (d->mac == 3 || d->mac == 4) d->need |= 4;
++        }
++        if (d->ilu) d->need |= 4;
++        if (d->end) break;
++    }
++    s_dec_n = n; s_dec_gen = s_prog_gen; s_dec_start = s_start_slot;
++}
++
++static inline vec4 dec_read(const VshIns *d, const VshSrc *src, const float in[NV2A_VSH_INPUTS][4],
++                            const vec4 *temp, const vec4 *opos, int a0)
++{
++    const float *s;
++    vec4 r;
++    if (src->mux == 1)
++        s = (src->reg == 12) ? opos->v : (src->reg < 12 ? temp[src->reg].v : temp[0].v);
++    else if (src->mux == 2)
++        s = in[d->input];
++    else {
++        int ci = (int)d->cidx + (d->rel ? a0 : 0);
++        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS) ci = 0;
++        s = s_const[ci];
++    }
++    r.v[0] = s[src->sw[0]]; r.v[1] = s[src->sw[1]]; r.v[2] = s[src->sw[2]]; r.v[3] = s[src->sw[3]];
++    if (src->neg) { r.v[0] = -r.v[0]; r.v[1] = -r.v[1]; r.v[2] = -r.v[2]; r.v[3] = -r.v[3]; }
++    return r;
++}
++
++static int vsh_run_dec(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++{
++    vec4 temp[12], opos;
++    float outregs[13][4];
++    int a0 = 0;
++    uint32_t i;
++
++    if (s_dec_gen != s_prog_gen || s_dec_start != s_start_slot)
++        decode_program();
++    memset(temp, 0, sizeof temp);
++    memset(&opos, 0, sizeof opos);
++    memset(outregs, 0, sizeof outregs);
++    outregs[3][3] = outregs[4][3] = 1.0f;
++    outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
++
++    for (i = 0; i < s_dec_n; i++) {
++        const VshIns *d = &s_dec[i];
++        vec4 a = {{0, 0, 0, 0}}, b = {{0, 0, 0, 0}}, c = {{0, 0, 0, 0}};
++        vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
++        if (d->need & 1) a = dec_read(d, &d->src[0], in, temp, &opos, a0);
++        if (d->need & 2) b = dec_read(d, &d->src[1], in, temp, &opos, a0);
++        if (d->need & 4) c = dec_read(d, &d->src[2], in, temp, &opos, a0);
++        if (d->mac)
++            mres = run_mac(d->mac, a, b, c, &a0);
++        if (d->ilu)
++            ires = run_ilu(d->ilu, c);
++        if (d->mac && d->mac != 13 && d->mac_mask) {
++            float *dst = d->tdst == 12 ? opos.v : (d->tdst < 12 ? temp[d->tdst].v : NULL);
++            if (dst) write_masked(dst, &mres, d->mac_mask);
++        }
++        if (d->ilu && d->ilu_mask) {
++            uint32_t it = d->mac ? 1u : d->tdst;      /* see vsh_run_ref */
++            float *dst = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
++            if (dst) write_masked(dst, &ires, d->ilu_mask);
++        }
++        if (d->omask) {
++            const vec4 *src = d->out_ilu ? &ires : &mres;
++            if (!d->out_reg) {
++                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                    write_masked(s_const[d->oaddr], src, d->omask);
++            } else if (d->oaddr == 0) {
++                write_masked(opos.v, src, d->omask);
++            } else if (d->oaddr < 13) {
++                write_masked(outregs[d->oaddr], src, d->omask);
++            }
++        }
++        if (d->end) {
++            int k;
++            memcpy(out->pos, opos.v, sizeof out->pos);
++            for (k = 0; k < 4; k++) {
++                float c0 = outregs[3][k], c1 = outregs[4][k];
++                out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
++                out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
++            }
++            memcpy(out->fog, outregs[5], sizeof out->fog);
++            memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
++            memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
++            memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
++            memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
++            return 1;
++        }
++    }
++    return 0;
++}
++
++static int vsh_run_ref(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
++
+ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++{
++    static int mode = -1;                         /* 0 decoded, 1 reference, 2 verify */
++    if (mode < 0)
++        mode = getenv("RECOMP_VSH_NODECODE") ? 1 : getenv("RECOMP_VSH_VERIFY") ? 2 : 0;
++    if (mode == 0 && !s_cxt_write && !vsh_dump_enabled())
++        return vsh_run_dec(in, out);
++    if (mode == 2 && !s_cxt_write) {
++        static unsigned long long n, bad;
++        Nv2aVshOutput r;
++        int a = vsh_run_dec(in, out), b = vsh_run_ref(in, &r);
++        n++;
++        if (a != b || (a && memcmp(out, &r, sizeof r) != 0)) {
++            bad++;
++            if (bad <= 8)
++                fprintf(stderr, "  [VSH] verify MISMATCH #%llu: dec ret %d pos %g %g %g %g | ref ret %d pos %g %g %g %g\n",
++                        bad, a, out->pos[0], out->pos[1], out->pos[2], out->pos[3], b, r.pos[0], r.pos[1], r.pos[2], r.pos[3]);
++        }
++        if ((n & 0xFFFFF) == 0)
++            fprintf(stderr, "  [VSH] verify: %llu vertices, %llu mismatches\n", n, bad);
++        *out = r;
++        return b;
++    }
++    return vsh_run_ref(in, out);
++}
++
++/* The original interpreter: decodes every field per vertex. Kept as the reference and for the cases the decoded
++ * path skips: RECOMP_VSH_DUMP, and programs that write constants (s_cxt_write), which are rare. */
++static int vsh_run_ref(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+ {
+     static int dump = -1;
+     static uint32_t dumped[16];
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index fedc97f..4584d7f 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -846,13 +846,21 @@ int xbox_VehMmioFault(void *exception_pointers)
+     fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+     if (!mmio_fault_va(fault, &va))
+         return 0;
+-    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+-        return g_apu_state
+-            && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
+-                   ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
+-    if (xbox_OhciOwnsAddress(va))
+-        return xbox_OhciHandleMmio(ep->ContextRecord, va);
+-    return 0;
++    {   /* Host code on the faulting guest thread: a guest suspend waits until it is done (kernel_bridge.c,
++         * bridge_NtSuspendThread). No parking here, inside exception dispatch: the next kernel call parks. */
++        extern void xbox_HostCodeEnter(void);
++        extern void xbox_HostCodeLeave(int park);
++        int r = 0;
++        xbox_HostCodeEnter();
++        if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
++            r = g_apu_state
++                && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
++                       ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
++        else if (xbox_OhciOwnsAddress(va))
++            r = xbox_OhciHandleMmio(ep->ContextRecord, va);
++        xbox_HostCodeLeave(0);
++        return r;
++    }
+ }
+ #else
+ #if defined(__aarch64__)

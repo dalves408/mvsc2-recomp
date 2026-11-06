@@ -1,0 +1,92 @@
+# Build artifacts
+build/
+out/
+bin/
+*.obj
+*.o
+*.lib
+*.a
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+Debug/
+Release/
+x64/
+
+# Generated recompiled code (regenerate from XBE with the recomp pipeline)
+src/recomp/gen/
+
+# Game files (user must provide their own legally-owned copies)
+game/
+*.xbe
+*.iso
+*.xiso
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local backups and logs
+*.bak*
+*.orig*
+*.pre*
+*.prefh
+*.pregrad
+*.pre_wd
+*.prefix*
+*_log.txt
+*.wav
+*.png
+*.bmp
+
+
+# Debug-kit builds and experimental local checkpoints
+/build_debug/
+*.xrstate
+
+# Player release: build folder and installer output (contain code translated from the game)
+build_release/
+installer/Output/
+installer/wizard_small_*.bmp
+scripts/__pycache__/
+build_nv.log
+build_release.log
+
+# Only source and what the build needs goes to GitHub. Notes, test tools and the debug kit stay local.
+*.md
+!/README.md
+/README.txt
+/docs/
+/tools/
+/resources/icons/
+/scripts/*
+!/scripts/regen.ps1
+!/scripts/patch_gen.ps1
+!/scripts/build_installer.py
+!/scripts/recomplauncher_manifest.py
+/src/mvc2_debug.c
+/src/mvc2_watch.c
+*.log
+!/resources/mvc2.png

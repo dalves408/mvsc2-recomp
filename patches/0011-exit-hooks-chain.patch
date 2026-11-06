@@ -1,0 +1,115 @@
+diff --git a/src/platform/recomp_exit_hook.c b/src/platform/recomp_exit_hook.c
+index fe0dc8d..1506e30 100644
+--- a/src/platform/recomp_exit_hook.c
++++ b/src/platform/recomp_exit_hook.c
+@@ -1,23 +1,39 @@
+ /*
+- * recomp_exit_hook.c - the hook a window runs before ExitProcess
+- * (recomp_exit_hook.h).
++ * recomp_exit_hook.c - the hooks a window (or the kernel's exit paths) runs
++ * before ExitProcess (recomp_exit_hook.h).
+  */
+ #include "recomp_exit_hook.h"
+ 
+ #include <stddef.h>
+ 
+-/* Set by whichever thread notes the first miss, read by the window thread:
+- * an aligned pointer store, so the reader sees the old or the new hook. */
+-static recomp_exit_hook_fn volatile s_hook;
++/* Up to four hooks: the kernel's missing-file summary registers itself lazily
++ * (on the first miss), and a game's debug kit registers at start-up; one slot
++ * let the later of the two silently replace the other. Slots are filled once
++ * and never cleared; a reader sees a slot as NULL or as the stored hook. */
++#define RECOMP_EXIT_HOOKS 4
++static recomp_exit_hook_fn volatile s_hooks[RECOMP_EXIT_HOOKS];
+ 
+ void recomp_exit_hook_set(recomp_exit_hook_fn fn)
+ {
+-    s_hook = fn;
++    int i;
++    if (fn == NULL)
++        return;
++    for (i = 0; i < RECOMP_EXIT_HOOKS; i++) {
++        if (s_hooks[i] == fn)
++            return;                     /* already registered */
++        if (s_hooks[i] == NULL) {
++            s_hooks[i] = fn;
++            return;
++        }
++    }
+ }
+ 
+ void recomp_exit_hook_run(const char *why)
+ {
+-    recomp_exit_hook_fn fn = s_hook;
+-    if (fn != NULL)
+-        fn(why);
++    int i;
++    for (i = 0; i < RECOMP_EXIT_HOOKS; i++) {
++        recomp_exit_hook_fn fn = s_hooks[i];
++        if (fn != NULL)
++            fn(why);
++    }
+ }
+diff --git a/src/platform/recomp_exit_hook.h b/src/platform/recomp_exit_hook.h
+index 437c6a0..ca8eb35 100644
+--- a/src/platform/recomp_exit_hook.h
++++ b/src/platform/recomp_exit_hook.h
+@@ -16,10 +16,11 @@ extern "C" {
+ 
+ typedef void (*recomp_exit_hook_fn)(const char *why);
+ 
+-/* One hook; a second call replaces the first. Any thread. */
++/* Adds a hook (up to four; the same function twice is kept once). Any thread. */
+ void recomp_exit_hook_set(recomp_exit_hook_fn fn);
+ 
+-/* Calls the hook, if one is set, with why ("window"). */
++/* Calls every hook, in the order they were added, with why ("window",
++ * "KeBugCheck", "HalReturnToFirmware", "HalInitiateShutdown"). */
+ void recomp_exit_hook_run(const char *why);
+ 
+ #ifdef __cplusplus
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 6481bc2..c38e36a 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -18,6 +18,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "platform/host_time.h"
++#include "platform/recomp_exit_hook.h"
+ #if defined(_WIN32)
+ #include <intrin.h>
+ #endif
+@@ -1251,6 +1252,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
+     /* ExitProcess skips atexit. Guest code calls this, never from inside
+      * the report's lock, so the summary's list write may take it. */
+     xbox_missing_summary("bugcheck");
++    recomp_exit_hook_run("KeBugCheck");
+     ExitProcess(BugCheckCode);
+ }
+ 
+@@ -1273,6 +1275,7 @@ VOID __stdcall xbox_KeBugCheckEx(
+     /* ExitProcess skips atexit. Guest code calls this, never from inside
+      * the report's lock, so the summary's list write may take it. */
+     xbox_missing_summary("bugcheck");
++    recomp_exit_hook_run("KeBugCheckEx");
+     ExitProcess(BugCheckCode);
+ }
+ 
+@@ -1321,6 +1324,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
+     /* stderr too: the kernel log file is rewritten on every run, so a title
+      * that ends itself otherwise leaves no trace in the run's own log. */
+     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
++    recomp_exit_hook_run("HalReturnToFirmware");   /* ExitProcess skips atexit */
+     ExitProcess(0);
+ }
+ 
+@@ -1328,6 +1332,7 @@ VOID __stdcall xbox_HalInitiateShutdown(void)
+ {
+     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+     fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
++    recomp_exit_hook_run("HalInitiateShutdown");
+     ExitProcess(0);
+ }
+ 

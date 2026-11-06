@@ -1,0 +1,78 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -710,6 +710,8 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
+ void guest_cpu_join(void);
+ void guest_cpu_part(void);
+ void xbox_HostCodeEnter(void);          /* deferred guest suspension: see bridge_NtSuspendThread */
++void xbox_HostCodePrepare(DWORD tid);
++void xbox_HostCodeAdopt(void);
+ void xbox_HostCodeLeave(int park);
+ 
+ static DWORD WINAPI bridge_thread_main(LPVOID param)
+@@ -725,7 +727,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+      * for every thread, which is how two of them ended up inside _lock() each
+      * holding the lock the other wanted. */
+     g_is_spawned_thread = 1;
+-    xbox_HostCodeEnter();   /* startup is host code: a guest suspend waits for bridge_run_thread_inline */
++    xbox_HostCodeAdopt();   /* startup is host code: a guest suspend waits for bridge_run_thread_inline */
+     g_esp = s->stack_top;
+     g_thread_stack_top = s->stack_top;
+     g_thread_obj_va = s->obj_va;
+@@ -781,18 +783,28 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+ {
+     struct bridge_thread_start *s = malloc(sizeof(*s));
+     HANDLE th;
++    DWORD tid = 0;
+ 
+     if (!s) return NULL;
+     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+     s->obj_va = obj_va;
+     s->tls_size = tls_size;
+ 
+-    th = CreateThread(NULL, 0, bridge_thread_main, s, s_spawn_suspended ? CREATE_SUSPENDED : 0, NULL);
++    /* Always created suspended: the thread counts as in host code before its
++     * first instruction. Windows' own thread startup takes the process heap
++     * lock, so a guest suspend that lands there and stops it at once leaves
++     * that lock held for good, and every thread that allocates blocks. */
++    th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, &tid);
+     if (!th) free(s);
+     /* Record the game thread so a host-tick-driven title's watchdog can sample
+      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
+      * spawn workers too, but never read it back. See kernel_thread.c. */
+-    else xbox_set_game_thread(th);
++    else {
++        xbox_HostCodePrepare(tid);
++        xbox_set_game_thread(th);
++        if (!s_spawn_suspended)
++            ResumeThread(th);
++    }
+     return th;
+ }
+ 
+@@ -5827,6 +5839,25 @@ void xbox_HostCodeEnter(void)
+         InterlockedIncrement(&s->host);
+ }
+ 
++/* For a thread not yet running: it starts out in host code. */
++void xbox_HostCodePrepare(DWORD tid)
++{
++    SuspSlot *s = susp_find(tid, 1);
++    if (s) {
++        s->pend = s->parked = 0;
++        s->host = 1;
++    }
++}
++
++/* The thread's first act: take up the slot Prepare set, or a new one. */
++void xbox_HostCodeAdopt(void)
++{
++    SuspSlot *s = susp_find(GetCurrentThreadId(), 1);
++    t_susp = s;
++    if (s && InterlockedCompareExchange(&s->host, 0, 0) == 0)
++        InterlockedIncrement(&s->host);
++}
++
+ void xbox_HostCodeLeave(int park)
+ {
+     SuspSlot *s = t_susp;

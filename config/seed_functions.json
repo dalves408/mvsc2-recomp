@@ -1,0 +1,692 @@
+[
+    {
+        "start":  "0x001FFFF0",
+        "observed":  true,
+        "note":  "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+    },
+    {
+        "start":  "0x00200030",
+        "observed":  true,
+        "note":  "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+    },
+    {
+        "start":  "0x002000A0",
+        "observed":  true,
+        "note":  "Indirect-call target observed at runtime; decodes as a function body."
+    },
+    {
+        "start":  "0x0020EDBB",
+        "observed":  true,
+        "note":  "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+    },
+    {
+        "start":  "0x0001F720",
+        "observed":  true,
+        "note":  "Indirect-call target observed at runtime after START on title screen; unresolved ICALL."
+    },
+    {
+        "start":  "0x0001E4A0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00020640",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00020660",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00020840",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00021150",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00021170",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00022010",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00022250",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0002ACD0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0002ACF0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00035D40",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00039B40",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00039CC0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0003B590",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0003FA80",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00047020",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00064230",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00064400",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x000686A0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00068970",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00069860",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x000700A0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0007CB30",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0007E6E0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0007F060",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0007F4C0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0007F530",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x000867F0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00088BF0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00089110",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0008F380",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0008FEE0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x000951F0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00095B50",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x000FEF37",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0016DE60",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00172510",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00173CF0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00174AB0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00178060",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00178080",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00178160",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0017E940",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0017ED70",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0017FDA0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00182AE0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00183D60",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00184010",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00186510",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0018A840",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0019C880",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0019CEF0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0019E070",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0019E3A0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0019EEC0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x001AD830",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x001AFD10",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x001B5FC0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x001BFDA0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x001C8EB0",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x001CC350",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00210C76",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00279500",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x002799A8",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0027D9B7",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0027DF07",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0027DF11",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0027EF59",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0027F276",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00280515",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x00282B60",
+        "observed":  false,
+        "note":  "gap scan: code chunk not covered by disassembly (indirect-call/vtable thunk)"
+    },
+    {
+        "start":  "0x0001EB20",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0001FC70",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00021760",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00029C10",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x000408A0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x000408C0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x000408E0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00040900",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00040920",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00040DA0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00040DC0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00078B90",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00079930",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0007AF80",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0007B730",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0007C450",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0007D090",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0007DD60",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0007E150",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x000839A0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00086160",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0008A210",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0008B510",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0008C700",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00093700",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0016D380",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00175F00",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00175F20",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00176250",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00176700",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00177F60",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00177F80",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00178250",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0017FA80",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001850B0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00186850",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x0018A020",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00193F70",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00195EE0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00196FE0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001A7360",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001A8910",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001AD3B0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B1410",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B1E60",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B38A0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B53B0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B6440",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B78A0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001B7F80",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001C2C80",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001C98F0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x001CA1B0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern"
+    },
+    {
+        "start":  "0x00021740",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern (any reg)"
+    },
+    {
+        "start":  "0x0007E500",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern (any reg)"
+    },
+    {
+        "start":  "0x00082EC0",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern (any reg)"
+    },
+    {
+        "start":  "0x0008CA90",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern (any reg)"
+    },
+    {
+        "start":  "0x0008D480",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern (any reg)"
+    },
+    {
+        "start":  "0x0019DC00",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] thunk found by byte pattern (any reg)"
+    },
+    {
+        "start":  "0x00022C30",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] state thunk missed by the byte-pattern scan; only ever reached through an indirect call (0x001766E0 observed as an unresolved ICALL in long mash runs: the CRT _getptd crash was its fallout)"
+    },
+    {
+        "start":  "0x001766E0",
+        "observed":  true,
+        "note":  "jmp [reg*4+tbl] state thunk missed by the byte-pattern scan; only ever reached through an indirect call (0x001766E0 observed as an unresolved ICALL in long mash runs: the CRT _getptd crash was its fallout)"
+    },
+    {
+        "start":  "0x00197D70",
+        "observed":  false,
+        "note":  "jmp [reg*4+tbl] state thunk missed by the byte-pattern scan; only ever reached through an indirect call (0x001766E0 observed as an unresolved ICALL in long mash runs: the CRT _getptd crash was its fallout)"
+    }
+]

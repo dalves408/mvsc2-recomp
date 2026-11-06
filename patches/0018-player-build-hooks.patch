@@ -1,0 +1,71 @@
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -222,15 +222,19 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+     InterlockedExchange(&s_frame_draws, (LONG)draws);
+ }
+ 
++/* A title's player build can remember the choice: called when the player switches with F11 or Alt+Enter, not for
++ * RECOMP_FULLSCREEN at start, so a mode forced at start is not saved. */
++void (*xbox_fb_fullscreen_changed)(int fullscreen);
++static int s_fb_full;
++
+ /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+  * gpu_present.c; both presenters letterbox to any size.) */
+ static void fb_toggle_fullscreen(HWND h)
+ {
+-    static int full;
+     static RECT saved;
+     static LONG_PTR saved_style;
+-    if (!full) {
++    if (!s_fb_full) {
+         MONITORINFO mi;
+         mi.cbSize = sizeof mi;
+         if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+@@ -241,12 +245,12 @@ static void fb_toggle_fullscreen(HWND h)
+         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                      mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+-        full = 1;
++        s_fb_full = 1;
+     } else {
+         SetWindowLongPtrA(h, GWL_STYLE, saved_style);
+         SetWindowPos(h, NULL, saved.left, saved.top, saved.right - saved.left,
+                      saved.bottom - saved.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+-        full = 0;
++        s_fb_full = 0;
+     }
+ }
+ 
+@@ -257,6 +261,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
+         || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
+         fb_toggle_fullscreen(h);
++        if (xbox_fb_fullscreen_changed)
++            xbox_fb_fullscreen_changed(s_fb_full);
+         return 0;
+     }
+     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
+@@ -605,6 +611,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             if (now - t0 >= 1000) {
+                 LONG f = s_flips;
+                 wchar_t tb[128];
++                if (getenv("RECOMP_FB_PLAIN_TITLE"))   /* a player build: this name, no numbers */
++                    _snwprintf(tb, 127, L"%hs", getenv("RECOMP_FB_PLAIN_TITLE"));
++                else
+                 _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
+                            t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                            (long)s_frame_draws);
+diff --git a/src/kernel/kernel_thunks.c b/src/kernel/kernel_thunks.c
+--- a/src/kernel/kernel_thunks.c
++++ b/src/kernel/kernel_thunks.c
+@@ -403,7 +403,7 @@ void xbox_kernel_init(void)
+     g_log_cs_init = TRUE;
+ 
+     /* Try to open log file, fall back to stderr */
+-    g_log_file = fopen("xbox_kernel.log", "w");
++    g_log_file = getenv("RECOMP_NO_KERNEL_LOG") ? NULL : fopen("xbox_kernel.log", "w");
+ 
+     /* Set log level from environment variable if present */
+     const char* log_env = getenv("XBOX_LOG_LEVEL");
