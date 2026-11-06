@@ -45,9 +45,8 @@ def manifest():
                 'A size too large for your screen is reduced to fit.'),
         setting('stretch', 'Stretch image', 'display/stretch', [('Off (4:3)', 0), ('On (fills window)', 1)], 0),
         setting('vsync', 'VSync', 'display/vsync', toggle, 1),
-        setting('msaa', 'Anti-aliasing', 'display/msaa', [('Off', 1)] + [(f'{n}x MSAA', n) for n in (2, 4, 8)], 1),
-        setting('anisotropy', 'Anisotropic filtering', 'display/anisotropy',
-                [('Off', 1)] + [(f'{n}x', n) for n in (2, 4, 8, 16)], 1),
+        setting('hires-textures', 'Hi-res textures', 'display/hires_textures', toggle, 1,
+                'Only has an effect when a texture pack is installed.'),
     ]
     return {
         '$schema': 'https://recomplauncher.com/schema/recomplauncher.json',

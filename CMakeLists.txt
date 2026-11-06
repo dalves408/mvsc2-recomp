@@ -97,6 +97,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     d3dcompiler
+    windowscodecs
+    ole32
     dxgi
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt

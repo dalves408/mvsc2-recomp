@@ -22,10 +22,6 @@ static const int V_RES[] = { 1, 2, 3, 4, 5 };
 static const char *const T_OFFON[] = { "Off", "On" };
 static const int V_OFFON[] = { 0, 1 };
 static const char *const T_STRETCH[] = { "Off (4:3)", "On (fills window)" };
-static const char *const T_AA[] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
-static const int V_AA[] = { 1, 2, 4, 8 };
-static const char *const T_ANISO[] = { "Off", "2x", "4x", "8x", "16x" };
-static const int V_ANISO[] = { 1, 2, 4, 8, 16 };
 static const char *const T_WIN[] = { "1x  640x480", "2x  1280x960", "3x  1920x1440", "4x  2560x1920" };
 static const int V_WIN[] = { 1, 2, 3, 4 };
 
@@ -36,8 +32,7 @@ static Opt s_opts[] = {
     { "Window size", "window_scale", 4, T_WIN, V_WIN, 1 },
     { "Stretch image", "stretch", 2, T_STRETCH, V_OFFON, 0 },
     { "VSync", "vsync", 2, T_OFFON, V_OFFON, 1 },
-    { "Anti-aliasing", "msaa", 4, T_AA, V_AA, 0 },
-    { "Anisotropic filter", "anisotropy", 5, T_ANISO, V_ANISO, 0 },
+    { "Hi-res textures", "hires_textures", 2, T_OFFON, V_OFFON, 1 },
 };
 #define OPT_COUNT ((int)(sizeof s_opts / sizeof *s_opts))
 #define ROW 32

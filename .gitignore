@@ -90,3 +90,4 @@ build_release.log
 /src/mvc2_watch.c
 *.log
 !/resources/mvc2.png
+texture_pack/

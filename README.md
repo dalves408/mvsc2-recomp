@@ -12,7 +12,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 
 - Direct3D 11 rendering, with render scale from 1x to 5x (640x480 to 3200x2400).
 - An upscaler (Lanczos resampling and contrast-adaptive sharpening) for when the picture is shown larger than it is drawn.
-- Anti-aliasing (MSAA up to 8x) and anisotropic filtering up to 16x.
+- Support for a hi-res texture pack for stages and menus. No pack is included; put PNGs named by a hash of their colors in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
 - Xbox One, Series and 360 controllers through XInput: up to 4 players, hot-plug and rumble.
@@ -35,7 +35,7 @@ The keyboard always counts as player 1, alongside any controller. PlayStation an
 | Esc | "Do you want to quit?" |
 | F11 or Alt+Enter | Switch fullscreen; the choice is remembered |
 
-The game pauses while a menu is open. In a menu, Up/Down chooses, Left/Right changes, Enter or A confirms, and Esc or B closes. Render scale and the filters apply when the menu closes.
+The game pauses while a menu is open. In a menu, Up/Down chooses, Left/Right changes, Enter or A confirms, and Esc or B closes. Render scale and hi-res textures apply when the menu closes.
 
 Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`, and saves in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting.
 

@@ -20,6 +20,8 @@ static unsigned long long gb_qf(void) { static LARGE_INTEGER f; if (!f.QuadPart)
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>     /* hi-res texture pack */
+#include <objbase.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,13 +40,12 @@ typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used;
                  ID3D11Texture2D *tex, *stage; ID3D11RenderTargetView *rtv; ID3D11ShaderResourceView *srv; uint32_t sampled;
                  /* deferred readback: the copy queued at the last flip (pstage, one of stage/stage2) and where it goes */
                  ID3D11Texture2D *stage2, *pstage; int pend; uint32_t pva, pw, ph, ppitch, pbpp;
-                 /* F1 options: mtex is the multisampled surface drawn to (tex then holds its resolve); down is the
-                  * guest-sized copy written back to guest memory when the render scale is above 1 */
-                 ID3D11Texture2D *mtex, *down; ID3D11RenderTargetView *down_rtv; uint32_t msdirty, shown_dirty; } Rt;
+                 /* down is the guest-sized copy written back to guest memory when the render scale is above 1 */
+                 ID3D11Texture2D *down; ID3D11RenderTargetView *down_rtv; uint32_t shown_dirty; } Rt;
 typedef struct { uint32_t va, w, h;
                  ID3D11Texture2D *tex; ID3D11DepthStencilView *dsv; } Ds;
 typedef struct { uint32_t offset, w, h, color, pitch; uint64_t hash; uint32_t used;
-                 uint64_t thash, sig; uint32_t vframe; /* texture-bytes hash, sample signature, s_frame+1 of the last full verify (get_tex fast path) */
+                 uint64_t thash, sig; uint32_t vframe, redecodes; /* texture-bytes hash, sample signature, s_frame+1 of the last full verify (get_tex fast path) */
                  ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; } TexEnt;
 typedef struct { uint32_t key[12]; void *obj; } StateEnt;
 
@@ -67,8 +68,8 @@ static ID3D11Texture2D *s_white;
 static ID3D11ShaderResourceView *s_white_srv;
 static uint32_t s_vb_off;
 /* F1 options, requested from the window's thread and applied at a flip. */
-static volatile int s_want_scale = 1, s_want_msaa = 1, s_want_aniso = 1;
-static int s_scale = 1, s_msaa = 1, s_aniso = 1, s_resets;
+static volatile int s_want_scale = 1;
+static int s_scale = 1, s_resets;
 static ID3D11VertexShader *s_bl_vs;
 static ID3D11PixelShader *s_bl_ps;
 static ID3D11Buffer *s_bl_cb;
@@ -228,19 +229,6 @@ static int gb_ready(void)
 
 /* ---- render targets ---------------------------------------------------- */
 
-/* The most samples (up to the wanted number) the card supports for both colour and depth. */
-static int msaa_supported(int want)
-{
-    int n;
-    for (n = want; n > 1; n >>= 1) {
-        UINT qc = 0, qd = 0;
-        ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_B8G8R8A8_UNORM, (UINT)n, &qc);
-        ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_D24_UNORM_S8_UINT, (UINT)n, &qd);
-        if (qc > 0 && qd > 0) break;
-    }
-    return n < 1 ? 1 : n;
-}
-
 /* Draw srv into rtv. Every draw sets all the state it needs, so nothing is restored but the bindings. */
 static void blit(ID3D11ShaderResourceView *srv, ID3D11RenderTargetView *rtv, uint32_t dw, uint32_t dh, uint32_t sw, uint32_t sh)
 {
@@ -271,18 +259,9 @@ static void blit(ID3D11ShaderResourceView *srv, ID3D11RenderTargetView *rtv, uin
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
 }
 
-static void rt_resolve(Rt *rt)
-{
-    if (rt->mtex && rt->msdirty) {
-        ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)rt->tex, 0, (ID3D11Resource *)rt->mtex, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
-        rt->msdirty = 0;
-    }
-}
-
 /* What a staging copy reads: the guest-sized image of this target. */
 static ID3D11Resource *rt_guest_image(Rt *rt)
 {
-    rt_resolve(rt);
     if (!rt->down) return (ID3D11Resource *)rt->tex;
     blit(rt->srv, rt->down_rtv, rt->w, rt->h, rt->w * (uint32_t)s_scale, rt->h * (uint32_t)s_scale);
     return (ID3D11Resource *)rt->down;
@@ -291,8 +270,8 @@ static ID3D11Resource *rt_guest_image(Rt *rt)
 static void rt_release(Rt *r)
 {
     SAFE_REL(r->rtv); SAFE_REL(r->srv); SAFE_REL(r->tex); SAFE_REL(r->stage); SAFE_REL(r->stage2);
-    SAFE_REL(r->mtex); SAFE_REL(r->down); SAFE_REL(r->down_rtv);
-    r->pend = 0; r->pstage = NULL; r->msdirty = 0; r->shown_dirty = 0; r->dirty = 0;
+    SAFE_REL(r->down); SAFE_REL(r->down_rtv);
+    r->pend = 0; r->pstage = NULL; r->shown_dirty = 0; r->dirty = 0;
 }
 
 /* After a change of size, a target starts from what the game last saw in guest memory, not from nothing:
@@ -325,7 +304,6 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
     if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t)) &&
         SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &v))) {
         blit(v, rt->rtv, s->width * (uint32_t)s_scale, s->height * (uint32_t)s_scale, s->width, s->height);
-        rt->msdirty = rt->mtex != NULL;
     }
     SAFE_REL(v); SAFE_REL(t);
     free(px);
@@ -355,14 +333,7 @@ static Rt *get_rt(const Nv2aSurface *s)
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].tex))) { rt_release(&s_rt[free_i]); return NULL; }
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].srv);
-    if (s_msaa > 1) {
-        td.SampleDesc.Count = (UINT)s_msaa; td.BindFlags = D3D11_BIND_RENDER_TARGET;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].mtex))) { rt_release(&s_rt[free_i]); return NULL; }
-        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_rt[free_i].mtex, NULL, &s_rt[free_i].rtv);
-        td.SampleDesc.Count = 1;
-    } else {
-        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].rtv);
-    }
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].rtv);
     td.Width = w; td.Height = h;
     if (s_scale > 1) {
         td.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -375,7 +346,7 @@ static Rt *get_rt(const Nv2aSurface *s)
     if (!s_rb_sync) ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].stage2);
     s_rt[free_i].va = s->color_va; s_rt[free_i].w = w; s_rt[free_i].h = h;
     s_rt[free_i].pitch = s->pitch; s_rt[free_i].bpp = s->bytes_per_pixel; s_rt[free_i].used = s_tick; s_rt[free_i].dirty = 0;
-    s_rt[free_i].msdirty = 0; s_rt[free_i].shown_dirty = 0;
+    s_rt[free_i].shown_dirty = 0;
     if (s_resets) rt_seed_from_guest(&s_rt[free_i], s);
     if (s_verbose || getenv("RECOMP_GPU_LOGRT"))
         fprintf(stderr, "[GPUBE] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u\n", s->color_va, w, h,
@@ -394,7 +365,7 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     if (slot < 0) { slot = (int)(s_tick & 3); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
     td.Width = s->width * (uint32_t)s_scale; td.Height = s->height * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = (UINT)s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
@@ -543,7 +514,7 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
 static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 {
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
-    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v, (minf != 1 && magf != 1) ? (uint32_t)s_aniso : 1u };
+    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v };
     ID3D11SamplerState *s = (ID3D11SamplerState *)find_state(s_ss, &s_nss, 48, key, 12);
     D3D11_SAMPLER_DESC d;
     if (s) return s;
@@ -554,7 +525,6 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
     else d.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     d.AddressU = addr_mode(t->addr_u); d.AddressV = addr_mode(t->addr_v); d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     d.MaxLOD = D3D11_FLOAT32_MAX; d.MaxAnisotropy = 1; d.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    if (key[4] > 1) { d.Filter = D3D11_FILTER_ANISOTROPIC; d.MaxAnisotropy = key[4]; }
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s))) return NULL;
     if (s_nss < 48) { memcpy(s_ss[s_nss].key, key, sizeof key); s_ss[s_nss].obj = s; s_nss++; }
     return s;
@@ -632,7 +602,198 @@ static int tex_ok(const Nv2aTexture *t)
         fprintf(stderr, "[GPUBE] bad texture skipped: offset %08X palette %08X %ux%u fmt %02X\n", t->offset, t->palette, t->width, t->height, t->color);
     return 0;
 }
+/* ---- hi-res texture pack ---------------------------------------------------
+ * <16 hex digits of pixel_hash>*.dds or .png in %LOCALAPPDATA%\MvC2Recomp\texture_pack or a texture_pack folder
+ * next to the exe (subfolders allowed) replace the decoded texture of that hash, any size. The hash covers the decoded
+ * colours only, so a pack can be made from the disc without running the game. The pack only holds stages and menus:
+ * character sprites are packed into sheets that change every frame, so no hash of theirs ever repeats. */
+typedef struct { uint64_t hash; char path[MAX_PATH]; } PackEnt;
+static PackEnt *s_pack;
+static int s_npack, s_pack_cap, s_pack_scanned;
+static volatile int s_want_hires = 1;
+static int s_hires = 1;
+
+static void pack_scan(const char *dir, int depth)
+{
+    char pat[MAX_PATH], sub[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    if (snprintf(pat, sizeof pat, "%s\\*", dir) >= (int)sizeof pat) return;
+    if ((h = FindFirstFileA(pat, &fd)) == INVALID_HANDLE_VALUE) return;
+    do {
+        size_t n = strlen(fd.cFileName);
+        if (fd.cFileName[0] == '.') continue;
+        if (snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName) >= (int)sizeof sub) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (depth < 4) pack_scan(sub, depth + 1); continue; }
+        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".dds")) && strspn(fd.cFileName, "0123456789abcdefABCDEF") >= 16) {
+            char hex[17];
+            if (s_npack == s_pack_cap) {
+                int cap = s_pack_cap ? s_pack_cap * 2 : 1024;
+                PackEnt *p = (PackEnt *)realloc(s_pack, (size_t)cap * sizeof *p);
+                if (!p) break;
+                s_pack = p; s_pack_cap = cap;
+            }
+            memcpy(hex, fd.cFileName, 16); hex[16] = 0;
+            s_pack[s_npack].hash = strtoull(hex, NULL, 16);
+            strcpy(s_pack[s_npack].path, sub);
+            s_npack++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static int pack_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const PackEnt *)a)->hash, y = ((const PackEnt *)b)->hash;
+    if (x != y) return x < y ? -1 : 1;
+    /* one hash in two forms: the .dds first, as it needs no decoding */
+    {
+        const char *p = ((const PackEnt *)a)->path, *q = ((const PackEnt *)b)->path;
+        int pd = !_stricmp(p + strlen(p) - 4, ".dds"), qd = !_stricmp(q + strlen(q) - 4, ".dds");
+        return qd - pd;
+    }
+}
+
+int mvc2_pack_count(void)
+{
+    if (!s_pack_scanned) {
+        char dir[MAX_PATH], *sl;
+        s_pack_scanned = 1;
+        if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) && strlen(dir) < MAX_PATH - 40) {
+            strcat(dir, "\\MvC2Recomp\\texture_pack");
+            pack_scan(dir, 0);
+        }
+        if (GetModuleFileNameA(NULL, dir, MAX_PATH) && (sl = strrchr(dir, '\\')) != NULL && (size_t)(sl - dir) < MAX_PATH - 20) {
+            strcpy(sl, "\\texture_pack");
+            pack_scan(dir, 0);
+        }
+        if (s_npack) {
+            int r, wr = 1;
+            qsort(s_pack, (size_t)s_npack, sizeof *s_pack, pack_cmp);
+            for (r = 1; r < s_npack; r++)
+                if (s_pack[r].hash != s_pack[wr - 1].hash) s_pack[wr++] = s_pack[r];
+            s_npack = wr;
+        }
+        fprintf(stderr, "[GPUBE] hi-res texture pack: %d files\n", s_npack);
+    }
+    return s_npack;
+}
+
+/* Every pixel's colour, position-dependent. Hot only while textures change, and quick next to decoding them. */
+static uint64_t pixel_hash(const uint32_t *argb, uint32_t w, uint32_t h)
+{
+    const uint64_t K = 0x9E3779B97F4A7C15ull;
+    uint64_t x = ((uint64_t)w << 32) | h, mul = K, step = K * 2;
+    size_t i, n = (size_t)w * h;
+    for (i = 0; i < n; i++, mul += step) x += (uint64_t)(argb[i] & 0xFFFFFFu) * mul;
+    x ^= x >> 29;
+    x *= K;
+    return x ^ (x >> 32);
+}
+
+/* A .dds with a DX10 header, mips as stored: no decoding and no mip generation. 0: not usable. */
+static int pack_make_dds(const char *path, TexEnt *e)
+{
+    enum { HDR = 4 + 124 + 20 };
+    FILE *f = fopen(path, "rb");
+    long size;
+    uint8_t *buf = NULL;
+    int ok = 0;
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size > HDR && (buf = (uint8_t *)malloc((size_t)size)) != NULL && fread(buf, 1, (size_t)size, f) == (size_t)size
+        && !memcmp(buf, "DDS ", 4) && !memcmp(buf + 84, "DX10", 4)) {
+        uint32_t h = *(uint32_t *)(buf + 12), w = *(uint32_t *)(buf + 16), mips = *(uint32_t *)(buf + 28);
+        uint32_t fmt = *(uint32_t *)(buf + 128), bx = fmt == DXGI_FORMAT_BC7_UNORM, m;
+        D3D11_SUBRESOURCE_DATA sd[16];
+        const uint8_t *q = buf + HDR, *end = buf + size;
+        if (!mips) mips = 1;
+        if ((bx || fmt == DXGI_FORMAT_B8G8R8A8_UNORM) && mips <= 16 && w && h && w <= 16384 && h <= 16384) {
+            uint32_t mw = w, mh = h;
+            D3D11_TEXTURE2D_DESC td;
+            for (m = 0; m < mips; m++) {
+                uint32_t pitch = bx ? ((mw + 3) / 4) * 16 : mw * 4, rows = bx ? (mh + 3) / 4 : mh;
+                sd[m].pSysMem = q; sd[m].SysMemPitch = pitch; sd[m].SysMemSlicePitch = 0;
+                if ((size_t)(end - q) < (size_t)pitch * rows) break;
+                q += (size_t)pitch * rows;
+                mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
+            }
+            if (m == mips) {
+                memset(&td, 0, sizeof td);
+                td.Width = w; td.Height = h; td.MipLevels = mips; td.ArraySize = 1; td.Format = (DXGI_FORMAT)fmt;
+                td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                ok = SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &e->tex));
+            }
+        }
+    }
+    free(buf);
+    fclose(f);
+    return ok;
+}
+
+/* Make e's texture from the pack image of this hash. 0: none, so the guest's own is used. */
 static int s_gen_mips;
+static int pack_make(uint64_t hash, TexEnt *e)
+{
+    static IWICImagingFactory *fac;
+    static int fac_tried;
+    int lo = 0, hi, found = -1, ok = 0;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *fr = NULL;
+    IWICFormatConverter *cv = NULL;
+    WCHAR wp[MAX_PATH];
+    UINT w = 0, h = 0;
+    uint8_t *px = NULL;
+
+    for (hi = s_npack - 1; lo <= hi; ) {
+        int m = (lo + hi) / 2;
+        if (s_pack[m].hash == hash) { found = m; break; }
+        if (s_pack[m].hash < hash) lo = m + 1; else hi = m - 1;
+    }
+    if (found < 0) return 0;
+    {
+        size_t len = strlen(s_pack[found].path);
+        if (len > 4 && !_stricmp(s_pack[found].path + len - 4, ".dds")) {
+            ok = pack_make_dds(s_pack[found].path, e);
+            { static unsigned n; if (n++ < 40 || (n % 100) == 0) fprintf(stderr, "[GPUBE] pack #%u dds ok=%d %016llX\n", n, ok, (unsigned long long)hash); }
+            return ok;
+        }
+    }
+    if (!fac_tried) {
+        fac_tried = 1;
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&fac))) fac = NULL;
+    }
+    if (!fac) return 0;
+    MultiByteToWideChar(CP_ACP, 0, s_pack[found].path, -1, wp, MAX_PATH);
+    if (SUCCEEDED(IWICImagingFactory_CreateDecoderFromFilename(fac, wp, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))
+        && SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))
+        && SUCCEEDED(IWICBitmapFrameDecode_GetSize(fr, &w, &h)) && w && h && w <= 16384 && h <= 16384
+        && SUCCEEDED(IWICImagingFactory_CreateFormatConverter(fac, &cv))
+        && SUCCEEDED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *)fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))
+        && (px = (uint8_t *)malloc((size_t)w * h * 4)) != NULL
+        && SUCCEEDED(IWICFormatConverter_CopyPixels(cv, NULL, w * 4, w * h * 4, px))) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = w; td.Height = h; td.MipLevels = 0; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex))) {
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0, NULL, px, w * 4, 0);
+            s_gen_mips = 1;
+            ok = 1;
+            { static unsigned n; if (n++ < 40 || (n % 100) == 0) fprintf(stderr, "[GPUBE] pack #%u %ux%u %016llX\n", n, w, h, (unsigned long long)hash); }
+        }
+    }
+    free(px);
+    if (cv) IWICFormatConverter_Release(cv);
+    if (fr) IWICBitmapFrameDecode_Release(fr);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    return ok;
+}
+
 static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
 {
     int i, free_i = -1, lru = 0;
@@ -646,7 +807,6 @@ static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].srv && s_rt[i].va == t->offset && s_rt[i].w == t->width && s_rt[i].h == t->height) {
             s_rt[i].sampled = s_frame + 1; st_rtsamples++;
-            rt_resolve(&s_rt[i]);
             return s_rt[i].srv;
         }
     QueryPerformanceCounter(&a);
@@ -664,12 +824,14 @@ static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
             { static int nc = -1; if (nc < 0) nc = getenv("RECOMP_GPU_NOTEXCACHE") ? 1 : 0; /* A/B switch: re-upload every draw */
               if (!nc && e->hash == h) { e->thash = th; e->sig = sample_sig(mem + t->offset, n); e->vframe = s_frame + 1; return e->srv; } }
             free_i = i;                    /* same slot, new content */
+            e->redecodes++;
             DEFER_REL(e->srv); DEFER_REL(e->tex);
             goto decode;
         }
         if (e->used < s_tx[lru].used) lru = i;
     }
     if (free_i < 0) { free_i = lru; DEFER_REL(s_tx[free_i].srv); DEFER_REL(s_tx[free_i].tex); }
+    s_tx[free_i].redecodes = 0;
 decode:
     {
         uint32_t *argb = (uint32_t *)malloc((size_t)t->width * t->height * 4);
@@ -681,20 +843,15 @@ decode:
         if (!argb) return s_white_srv;
         if (!nv2a_backend_decode_texture(t, argb)) { fprintf(stderr, "[GPUTR] decode FAILED fmt=%02X %ux%u\n", t->color, t->width, t->height); free(argb); e->tex = NULL; return s_white_srv; }
         q1 = qpc_us(); st_dec_us += q1 - q0;
+        /* A slot rewritten this often is a sprite sheet, which no pack can hold: not worth hashing every version. */
+        if (s_hires && e->redecodes < 64 && mvc2_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), e)) { free(argb); goto made; }
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = argb; sd.SysMemPitch = t->width * 4; sd.SysMemSlicePitch = 0;
         if (s_flush_tex) ID3D11DeviceContext_Flush(s_ctx);
-        if (s_aniso > 1 && t->width > 1 && t->height > 1) {   /* the anisotropic filter needs mip levels to work from */
-            td.MipLevels = 0; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags |= D3D11_BIND_RENDER_TARGET; td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
-            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex))) {
-                ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0, NULL, argb, t->width * 4, 0);
-                s_gen_mips = 1;
-            }
-        }
-        if (!e->tex && FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &e->tex))) { fprintf(stderr, "[GPUBE] CreateTexture2D failed %ux%u fmt=%02X\n", t->width, t->height, t->color); free(argb); e->tex = NULL; return s_white_srv; }
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &e->tex))) { fprintf(stderr, "[GPUBE] CreateTexture2D failed %ux%u fmt=%02X\n", t->width, t->height, t->color); free(argb); e->tex = NULL; return s_white_srv; }
         { static int tl = -1; static unsigned nlog;
           if (tl < 0) tl = getenv("RECOMP_GPU_TEXLOG") ? 1 : 0;
           if (tl && nlog < 400) { nlog++;
@@ -703,6 +860,7 @@ decode:
               { unsigned a0 = 0, aw = 0; size_t k, np = (size_t)t->width * t->height; for (k = 0; k < np; k++) { if ((argb[k] >> 24) == 0) a0++; else if (argb[k] == 0xFFFFFFFFu) aw++; } fprintf(stderr, " decoded: alpha0=%u%% white=%u%%\n", (unsigned)(a0 * 100ull / np), (unsigned)(aw * 100ull / np)); }
           } }
         free(argb);
+made:
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
         if (s_gen_mips) { s_gen_mips = 0; ID3D11DeviceContext_GenerateMips(s_ctx, e->srv); }
         if (s_flush_tex) ID3D11DeviceContext_Flush(s_ctx);
@@ -734,19 +892,27 @@ static void texdump(const Nv2aTexture *t)
     static uint64_t seen[16384]; static unsigned nseen;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint64_t h;
-    uint32_t *argb, k, hdr[13];
+    uint32_t *argb, k, hdr[13], *per_slot = NULL;
     char path[512];
     FILE *f;
     if (t->color == 0x1E && t->width >= 640) return;   /* the full-frame copy: new every frame, and not artwork */
+    {   /* character sprite sheets: thousands of versions at one address, and no version ever comes back */
+        static struct { uint32_t off, n; } per[1024]; static unsigned nper;
+        unsigned j;
+        for (j = 0; j < nper && per[j].off != t->offset; j++) {}
+        if (j == nper && nper < 1024) { per[j].off = t->offset; per[j].n = 0; nper++; }
+        if (j < nper) { if (per[j].n >= 100) return; per_slot = &per[j].n; }
+    }
     h = hash_bytes(mem + t->offset, tex_bytes(t));
     if (t->color == 0x0B && t->palette) h ^= hash_bytes(mem + t->palette, 1024) * 31u;
     for (k = 0; k < nseen; k++) if (seen[k] == h) return;
     if (nseen == 16384) return;
     seen[nseen++] = h;
+    if (per_slot) (*per_slot)++;
     if (!(argb = (uint32_t *)malloc((size_t)t->width * t->height * 4))) return;
     if (!nv2a_backend_decode_texture(t, argb)) { free(argb); return; }
-    snprintf(path, sizeof path, "%s\\t%08X_%08X_%02X_%ux%u_%08X.bmp", getenv("RECOMP_GPU_TEXDUMP"), t->offset, t->palette,
-             t->color, t->width, t->height, (uint32_t)h);
+    snprintf(path, sizeof path, "%s\\t%08X_%08X_%02X_%ux%u_%016llX.bmp", getenv("RECOMP_GPU_TEXDUMP"), t->offset, t->palette,
+             t->color, t->width, t->height, (unsigned long long)h);
     if ((f = fopen(path, "wb")) != NULL) {
         uint32_t img = t->width * t->height * 4;
         fputc('B', f); fputc('M', f);
@@ -859,7 +1025,7 @@ static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint3
         c[0] = ((argb >> 16) & 255) / 255.0f; c[1] = ((argb >> 8) & 255) / 255.0f;
         c[2] = (argb & 255) / 255.0f; c[3] = ((argb >> 24) & 255) / 255.0f;
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
-        rt->dirty = 1; rt->msdirty = 1; rt->shown_dirty = 1;
+        rt->dirty = 1; rt->shown_dirty = 1;
     }
     if ((flags & 3) && (ds = get_ds(s, rs->zeta_va)) != NULL) {
         UINT f = 0;
@@ -1049,7 +1215,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     if (s_flush_mode && (s_flush_mode >= 3 || (cb.textured && (s_flush_mode >= 2 || (b->texture && b->texture->color == 0x0B && b->texture->width == 512))))) ID3D11DeviceContext_Flush(s_ctx);
     if (td_probe) probe_after_draw(rt, srv, b);
     s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
-    rt->dirty = 1; rt->msdirty = 1; rt->shown_dirty = 1;
+    rt->dirty = 1; rt->shown_dirty = 1;
     st_draws++; st_tris += kept / 3;
 }
 
@@ -1167,7 +1333,6 @@ static void publish_frame(void)
             s_share_on = 1;
         }
     }
-    rt_resolve(rt);
     if (FAILED(IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 4))) return;   /* the window has it: the next flip's frame */
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
     IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
@@ -1175,29 +1340,27 @@ static void publish_frame(void)
     gpu_present_frame_ready();
 }
 
-void mvc2_video_request(int scale, int msaa, int aniso)
+void mvc2_video_request(int scale, int hires)
 {
-    s_want_scale = scale; s_want_msaa = msaa; s_want_aniso = aniso;
+    s_want_scale = scale; s_want_hires = hires;
 }
 
 /* Between frames, on the pushbuffer thread. */
 static void video_apply(void)
 {
-    int scale = s_want_scale, msaa = msaa_supported(s_want_msaa), aniso = s_want_aniso, i;
-    if (aniso != s_aniso) {
-        for (i = 0; i < s_nss; i++) IUnknown_Release((IUnknown *)s_ss[i].obj);
-        s_nss = 0;
+    int scale = s_want_scale, hires = s_want_hires, i;
+    if (hires != s_hires) {                 /* every texture is looked up in the pack again */
         for (i = 0; i < MAX_TEX; i++) { DEFER_REL(s_tx[i].srv); DEFER_REL(s_tx[i].tex); s_tx[i].used = 0; }
-        s_aniso = aniso;
+        s_hires = hires;
     }
-    if (scale != s_scale || msaa != s_msaa) {
+    if (scale != s_scale) {
         ID3D11RenderTargetView *none = NULL;
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &none, NULL);
         for (i = 0; i < MAX_RT; i++) { rt_release(&s_rt[i]); s_rt[i].va = 0; }
         for (i = 0; i < 4; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); s_ds[i].va = 0; }
-        s_scale = scale; s_msaa = msaa;
+        s_scale = scale;
         s_resets++;
-        fprintf(stderr, "[GPUBE] video: render scale %dx, %dx MSAA, %dx anisotropic\n", s_scale, s_msaa, s_aniso);
+        fprintf(stderr, "[GPUBE] video: render scale %dx\n", s_scale);
     }
 }
 
