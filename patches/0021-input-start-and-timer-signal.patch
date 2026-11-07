@@ -1,0 +1,108 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -3966,6 +3966,18 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+     }
+ 
++    /* A freshly set timer starts unsignaled, like the real KeSetTimer. This comes
++     * before the timer is armed: once it is in the table the timer thread can fire
++     * it at any moment, and clearing the event after that would swallow the signal.
++     * A one-shot is gone from the table by then, so whoever waits on it waits for
++     * good. A title that re-arms a timer from its own wake-up, with a due time of
++     * zero when it has fallen behind, hits this sooner or later. */
++    {
++        HANDLE ev = ke_shadow_lookup(timer_va);
++        if (ev)
++            ResetEvent(ev);
++    }
++
+     EnterCriticalSection(&g_timer_lock);
+     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+         if (g_timers[i].timer_va == timer_va) { free_slot = i; was_set = 1; break; }
+@@ -3978,13 +3990,6 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+         g_timers[free_slot].period_ms = period_ms;
+     }
+     LeaveCriticalSection(&g_timer_lock);
+-
+-    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
+-    {
+-        HANDLE ev = ke_shadow_lookup(timer_va);
+-        if (ev)
+-            ResetEvent(ev);
+-    }
+     g_eax = was_set;
+ }
+ 
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -642,6 +642,51 @@ static int usb_gamepad_report_raw(int pad, uint8_t *out, int max)
+ volatile int xbox_input_block;
+ volatile int xbox_input_back_start;
+ 
++/* Back + Start is rarely pressed in the same instant. A Start on its own is held back briefly in case a Back
++ * follows; a tap shorter than the wait is still delivered, late, and long enough for the game to see it. */
++#define BACK_START_WAIT_MS  80
++#define BACK_START_PULSE_MS 60
++enum { BS_IDLE, BS_WAIT, BS_PASS, BS_HIDE, BS_PULSE };
++static int s_bs_state;
++static unsigned long s_bs_t;
++
++static void back_start_blocked(uint8_t buttons)
++{
++    s_bs_state = (buttons & 0x10) ? BS_HIDE : BS_IDLE;   /* still held when the block ends: not a press */
++}
++
++static void back_start_filter(uint8_t *out)
++{
++    unsigned long now = (unsigned long)GetTickCount();
++    int start = (out[2] & 0x10) != 0;
++
++    out[2] &= (uint8_t)~0x10;
++    if (out[2] & 0x20) {
++        s_bs_state = start ? BS_HIDE : BS_IDLE;
++        return;
++    }
++    switch (s_bs_state) {
++    case BS_IDLE:
++        if (start) { s_bs_state = BS_WAIT; s_bs_t = now; }
++        break;
++    case BS_WAIT:
++        if (!start) { s_bs_state = BS_PULSE; s_bs_t = now; out[2] |= 0x10; }
++        else if (now - s_bs_t >= BACK_START_WAIT_MS) { s_bs_state = BS_PASS; out[2] |= 0x10; }
++        break;
++    case BS_PASS:
++        if (start) out[2] |= 0x10;
++        else s_bs_state = BS_IDLE;
++        break;
++    case BS_HIDE:
++        if (!start) s_bs_state = BS_IDLE;
++        break;
++    case BS_PULSE:
++        if (now - s_bs_t < BACK_START_PULSE_MS) out[2] |= 0x10;
++        else s_bs_state = start ? BS_WAIT : BS_IDLE, s_bs_t = now;
++        break;
++    }
++}
++
+ int usb_gamepad_report(int pad, uint8_t *out, int max)
+ {
+     static int dbg = -1;
+@@ -651,10 +696,13 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+     static unsigned long nrep[USB_GAMEPAD_MAX];
+     int n = usb_gamepad_report_raw(pad, out, max);
+ 
+-    if (xbox_input_block && n == 20)
++    if (xbox_input_block && n == 20) {
++        if (pad == 0)
++            back_start_blocked(out[2]);
+         memset(out + 2, 0, 18);
+-    else if (xbox_input_back_start && pad == 0 && n >= 3 && (out[2] & 0x20))
+-        out[2] &= (uint8_t)~0x10;
++    } else if (xbox_input_back_start && pad == 0 && n >= 3) {
++        back_start_filter(out);
++    }
+     if (dbg < 0) {
+         const char *e = getenv("RECOMP_PAD_DEBUG");
+         dbg = e && *e && *e != '0';

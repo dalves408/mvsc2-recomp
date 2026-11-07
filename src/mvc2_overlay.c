@@ -34,7 +34,7 @@ static volatile int s_active;
 static int s_settings, s_sel, s_armed, s_quit_yes;
 static HWND s_win;
 static int s_cw, s_ch, s_ox, s_oy;
-static int s_pad_valid, s_unblock_wait;
+static int s_pad_valid, s_unblock_wait, s_chord_held;
 static DWORD s_unblock_t;
 
 static int s_scale = 1, s_stretch, s_vsync = 1, s_upscaling, s_hires = 1, s_sprite, s_smooth, s_sharpen;
@@ -496,18 +496,15 @@ static void tick(void)
             || GetTickCount() - s_unblock_t > 2000) {
             xbox_input_block = 0;
             s_unblock_wait = 0;
+            s_chord_held = 1;                       /* buttons still down from closing it do not open it again */
         }
-    } else {                                        /* Back + Start: settings */
-        static WORD prev;
+    } else {                                        /* Back + Start, either one first: settings */
         XINPUT_STATE st;
-        if (XInputGetState(0, &st) == ERROR_SUCCESS) {
-            WORD b = st.Gamepad.wButtons;
-            if ((b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START) && !(prev & XINPUT_GAMEPAD_START))
-                open_overlay(1);
-            prev = b;
-        } else {
-            prev = 0;
-        }
+        int chord = XInputGetState(0, &st) == ERROR_SUCCESS
+                    && (st.Gamepad.wButtons & XINPUT_GAMEPAD_BACK) && (st.Gamepad.wButtons & XINPUT_GAMEPAD_START);
+        if (chord && !s_chord_held)
+            open_overlay(1);
+        s_chord_held = chord;
     }
 }
 
