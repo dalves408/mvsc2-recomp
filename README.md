@@ -4,7 +4,7 @@ A static recompilation of **Marvel vs. Capcom 2 (Original Xbox, NTSC-U)** to a n
 
 The game's Xbox executable is disassembled and translated to C, then built with MSVC against a small runtime that stands in for the Xbox kernel, the NV2A GPU, the sound hardware and the USB pads. It is not an emulator: the game's code runs directly on your CPU.
 
-> **Status: playtest. There is no release yet.** The game plays from the title screen through the menus and character select into fights. A full Arcade run, two-player play and saves across sessions have not been fully tested.
+> **Status: version 1.0.0.** The game plays from the title screen through the menus and character select into fights. A full Arcade run, two-player play and saves across sessions have not been fully tested.
 
 **This repo has no game data.** It holds only the project's own source code and what is needed to build it. It does not contain the disc image, the game's files, `default.xbe`, the C code generated from the game, or a built game. You need your own copy of the game, serial CC-007.
 
@@ -13,11 +13,21 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 - Direct3D 11 rendering, with three render scales: Original, Medium and High.
 - An upscaler (Lanczos resampling and contrast-adaptive sharpening) for when the picture is shown larger than it is drawn.
 - Sprite filters for the characters: xBR, OmniScale or ScaleFX, with optional smoothing and sharpening. Stages are left alone.
-- Support for a hi-res texture pack for stages and menus. No pack is included; put DDS or PNG files named by hashes of their colors and transparency in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
+- An optional hi-res texture pack for stages and menus, installed by Setup or by its own addon (see Installing). The game also reads DDS or PNG files named by hashes of their colors and transparency from `texture_pack` beside the game or in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
 - Xbox One, Series and 360 controllers through XInput: up to 4 players, hot-plug and rumble.
-- A Setup that copies the game files from your own disc image or folder, and [RecompLauncher](https://recomplauncher.com/sdk) support.
+- A Setup that copies the game files from your own disc image or folder, a settings program (`config.exe`) with Video, Controls and Textures tabs, and [RecompLauncher](https://recomplauncher.com/sdk) support up to Level 3.
+
+## Installing
+
+Download from [Releases](https://github.com/dalves408/mvsc2-recomp/releases):
+
+- **`MvC2-Setup-<version>.exe`** installs the game (to `C:\Games\Marvel vs. Capcom 2` by default) and copies the game files from your own disc image (`.iso` or `.xiso`) or folder. Run over an existing install, it updates or repairs the program files and keeps your game files, saves and settings. Its optional **hi-res texture pack** task downloads the pack (634 MB) and installs it.
+- **`MvC2-HiRes-Textures-<n>-Setup.exe`**, on the `textures-<n>` release, adds the hi-res texture pack to an installed game.
+- **`MvC2-v<version>-Windows-x64.zip`** is for RecompLauncher, which sets the game up from your disc itself.
+
+Both Setups use a `texture-01.bin` placed beside them instead of downloading it, resume an interrupted download, and check the file's size and SHA-256 before installing.
 
 ## Controls
 
@@ -28,7 +38,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 | Backspace | Back | | W A S D | Left stick |
 | Z / X / C / V | A / B / X / Y | | Left Shift / Left Ctrl | Left / Right thumb click |
 
-The keyboard always counts as player 1, alongside any controller. PlayStation and Switch pads need Steam Input or DS4Windows to appear as XInput. The game's own CONFIG menu rebinds its buttons.
+The keyboard always counts as player 1, alongside any controller. The keys above are the defaults: the Controls tab of the settings program (`config.exe`, "Marvel vs. Capcom 2 Settings" in the Start menu) gives each Xbox control a key and an alternate key. PlayStation and Switch pads need Steam Input or DS4Windows to appear as XInput. The game's own CONFIG menu rebinds its buttons.
 
 | Key | What it does |
 |---|---|
@@ -38,7 +48,7 @@ The keyboard always counts as player 1, alongside any controller. PlayStation an
 
 The game pauses while a menu is open. In a menu, Up/Down chooses, Left/Right changes, Enter or A confirms, and Esc or B closes. Render scale and hi-res textures apply when the menu closes.
 
-Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`, and saves in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting.
+Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`: the video options and the hi-res texture switch in `[display]`, your keys in `[keys]`. Saves are in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting; `desktop` uses the saved setting.
 
 ## Building
 
@@ -74,10 +84,11 @@ C:\Recomp\MvsC2\extracted      your extracted game files (default.xbe and data)
 
 ```powershell
 python installer\gen_manifest.py C:\Recomp\MvsC2\extracted
+python scripts\build_texture_pack.py --source <folder of .dds files> --revision 1
 python scripts\build_installer.py --version 1.0.0
 ```
 
-This builds the player version in `build_release`, with the C runtime linked in and developer switches ignored. It writes `MvC2-Setup-<version>.exe` and a RecompLauncher ZIP to `installer\Output`. Both contain code translated from the game, so they must not be committed.
+This builds the player version in `build_release`, with the C runtime linked in and developer switches ignored. `build_texture_pack.py` packs the hi-res textures into 7z `.bin` parts under 2 GB each and writes their sizes, SHA-256 and download links to `installer\texture_payload.iss`. `build_installer.py` then writes `MvC2-Setup-<version>.exe`, the texture addon `MvC2-HiRes-Textures-<n>-Setup.exe`, a RecompLauncher ZIP and the `.bin` parts to `installer\Output`. They contain code or art from the game, so they must not be committed: the `.bin` parts go on a `textures-<n>` release, the rest on the game's release.
 
 ## How it works
 
@@ -92,7 +103,7 @@ This builds the player version in `build_release`, with the C runtime linked in 
 | `src/` | Entry point, renderer, ESC and F1 overlays, hand-written overrides |
 | `patches/` | Changes to the xboxrecomp toolkit, applied in order |
 | `config/` | Extra function entry points for the recompiler |
-| `installer/` | Setup script, disc importer, settings program |
+| `installer/` | Setup scripts, disc importer, texture downloader, settings program |
 | `scripts/` | Code generation and release build |
 | `resources/` | Icon and version information |
 
@@ -106,7 +117,7 @@ This builds the player version in `build_release`, with the C runtime linked in 
 
 ## Credits and legal
 
-- [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) provides the recompilation toolkit, under the MIT license. Its MCPX APU sources and `nv2a_regs.h` come from [xemu](https://github.com/xemu-project/xemu) and are under LGPL-2.1-or-later. Patches to those files stay under that license; see the toolkit's `NOTICE`.
+- [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) provides the recompilation toolkit, under the MIT license.
 - The sprite filters are ports of OmniScale by Lior Halphon, ScaleFX by Sp00kyFox and xBR by Hyllian, from [libretro/slang-shaders](https://github.com/libretro/slang-shaders), each under MIT; their notices are in `src/sprite_filter.c`.
 - This project's own code is under the [MIT license](LICENSE). That license does not cover the game or anything generated from it.
 - Marvel vs. Capcom 2 is the property of Capcom and Marvel. This project is unofficial and is not affiliated with either company.
