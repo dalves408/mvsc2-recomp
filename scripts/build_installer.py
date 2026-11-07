@@ -2,13 +2,15 @@
 
     python scripts/build_installer.py --version 1.0.0
 
-Output in installer/Output: MvC2-Setup-<version>.exe, MvC2-v<version>-Windows-x64.zip, and a .sha256 for each.
+Output in installer/Output: MvC2-Setup-<version>.exe, MvC2-v<version>-Windows-x64.zip and
+MvC2-HiRes-Textures-<revision>-Setup.exe, each with a .sha256, and the texture pack's texture-*.bin parts.
 Both contain code translated from the game, so they stay out of git.
 """
 import argparse
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -67,13 +69,29 @@ def main():
         set_rc_version(ROOT / 'resources' / rc, args.version)
     if not args.skip_build:
         run('cmake', '-S', ROOT, '-B', BUILD, '-DMVC2_RELEASE=ON')
-        run('cmake', '--build', BUILD, '--config', 'Release', '-j', '12', '--target', 'mvc2_recomp', 'mvc2_import', 'mvc2_config')
+        run('cmake', '--build', BUILD, '--config', 'Release', '-j', '12', '--target', 'mvc2_recomp', 'mvc2_import', 'mvc2_config',
+            'mvc2_texture_download')
     wizard_images()
     OUTPUT.mkdir(exist_ok=True)
     run(ISCC, f'/DAppVersion={args.version}', INSTALLER / 'mvc2.iss')
     setup = OUTPUT / f'MvC2-Setup-{args.version}.exe'
     print(f'Setup: {setup}\nSHA-256: {write_sha256(setup)}')
     run(sys.executable, ROOT / 'scripts' / 'recomplauncher_manifest.py', '--version', args.version)
+
+    # The hi-res texture addon and the pack's .bin parts (made by scripts/build_texture_pack.py), so a copy of
+    # this folder installs offline: both Setups use the parts beside them before downloading.
+    payload = (INSTALLER / 'texture_payload.iss').read_text(encoding='ascii')
+    revision = re.search(r'#define TextureVersion "(\d+)"', payload).group(1)
+    run(ISCC, INSTALLER / 'mvc2_textures.iss')
+    addon = OUTPUT / f'MvC2-HiRes-Textures-{revision}-Setup.exe'
+    print(f'Texture addon: {addon}')
+    print(f'SHA-256: {write_sha256(addon)}')
+    parts = sorted((ROOT / 'out' / 'texture-release' / f'revision-{revision}').glob('texture-*.bin'))
+    if not parts:
+        sys.exit(f'no texture-*.bin for revision {revision}: run scripts/build_texture_pack.py first')
+    for part in parts:
+        shutil.copyfile(part, OUTPUT / part.name)
+        print(f'{part.name}: {part.stat().st_size:,} bytes')
 
 
 if __name__ == '__main__':

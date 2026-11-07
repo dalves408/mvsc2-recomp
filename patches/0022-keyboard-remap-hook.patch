@@ -1,0 +1,41 @@
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -147,6 +147,8 @@ static int row_control(const xbox_key_row *r)
+     return -1;
+ }
+ 
++int (*xbox_key_remap)(size_t row, int slot, int vk);
++
+ void xbox_InputKeyboardBindings(InputBindings *b)
+ {
+     memset(b, 0, sizeof *b);
+@@ -155,9 +157,11 @@ void xbox_InputKeyboardBindings(InputBindings *b)
+     for (size_t i = 0; i < xbox_key_map_count; i++) {
+         const xbox_key_row *r = &xbox_key_map[i];
+         int c = row_control(r);
+-        for (int k = 0; k < 2; k++)
+-            if (c >= 0 && r->vk[k] && b->count[c] < INPUT_BINDINGS_PER_CONTROL)
+-                b->key[c][b->count[c]++] = r->vk[k];
++        for (int k = 0; k < 2; k++) {
++            int vk = xbox_key_remap ? xbox_key_remap(i, k, r->vk[k]) : r->vk[k];
++            if (c >= 0 && vk > 0 && vk < INPUT_KEY_COUNT && b->count[c] < INPUT_BINDINGS_PER_CONTROL)
++                b->key[c][b->count[c]++] = (uint8_t)vk;
++        }
+     }
+ }
+ 
+diff --git a/src/input/keyboard.h b/src/input/keyboard.h
+--- a/src/input/keyboard.h
++++ b/src/input/keyboard.h
+@@ -135,6 +135,10 @@ typedef struct xbox_key_row {
+ extern const xbox_key_row xbox_key_map[];
+ extern const size_t       xbox_key_map_count;
+ 
++/* A title's own keys: called for each row of xbox_key_map and each of its two key slots, with the
++ * map's key (0 for none); returns the key to use instead (0 for none). NULL keeps the map. */
++extern int (*xbox_key_remap)(size_t row, int slot, int vk);
++
+ #ifdef __cplusplus
+ }
+ #endif

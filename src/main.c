@@ -554,6 +554,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     { extern void mvc2_gpu_backend_install(void); mvc2_gpu_backend_install(); }
+    { extern void mvc2_keymap_init(void); mvc2_keymap_init(); }     /* the player's keys from config.exe */
     { extern void mvc2_overlay_init(void); mvc2_overlay_init(); }   /* ESC quit prompt, F1 settings */
     { extern void xbox_set_vblank_hz(unsigned hz); const char *hz = getenv("RECOMP_VBLANK_HZ"); if (hz) xbox_set_vblank_hz((unsigned)atoi(hz)); }
     { const char *sdv = getenv("RECOMP_STALL_DUMP"); if (sdv && atoi(sdv) > 0) CreateThread(NULL, 0, sd_thread, (LPVOID)(uintptr_t)atoi(sdv), 0, NULL); }

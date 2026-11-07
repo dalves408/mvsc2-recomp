@@ -7,6 +7,7 @@
 #ifndef AppVersion
 #define AppVersion "1.0.0"
 #endif
+#include "texture_payload.iss"
 #ifndef BuildDir
 #define BuildDir "..\build_release\Release"
 #endif
@@ -39,6 +40,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ExtraDiskSpaceRequired=300000000
+ArchiveExtraction=enhanced/nopassword
 
 [Messages]
 WelcomeLabel2=This installs the Marvel vs. Capcom 2 PC recompilation.%n%nThe game's own files are not included. You need your own copy of the Xbox disc: a disc image (.iso or .xiso) or a folder with the game's files. Setup will ask for it and copy the files it needs.
@@ -48,6 +50,8 @@ Source: "{#BuildDir}\mvc2_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\mvc2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+; the hi-res texture pack's download helper, run from Setup's temp folder when the texture task is chosen
+Source: "{#BuildDir}\mvc2_texture_download.exe"; Flags: dontcopy
 
 [Dirs]
 ; an empty folder the game needs for its sound effects and voices; here too so Repair and updates fix an older install
@@ -59,10 +63,13 @@ Name: "{autoprograms}\Marvel vs. Capcom 2 Settings"; Filename: "{app}\config.exe
 Name: "{autodesktop}\Marvel vs. Capcom 2"; Filename: "{app}\mvc2_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]
+Name: "hires"; Description: "Install the hi-res texture pack ({#TextureDownloadBytes / 1000000} MB download if needed)"; Flags: unchecked; Check: TexturePackNeedsInstall
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\game_files"
+; the hi-res texture pack (added by this Setup's texture task or by the texture addon)
+Type: filesandordirs; Name: "{app}\texture_pack"
 
 [Code]
 var
@@ -73,6 +80,10 @@ var
   VerRel: Integer;          { -1: the installed version is older, 0: same, 1: newer than this Setup }
   RepairRadio, QuitRadio: TNewRadioButton;
   QuitNow: Boolean;
+
+#define TextureOptional
+#include "texture_download_code.iss"
+
 { The game files are in place: default.xbe and a few of the largest files, so an install that was
   interrupted halfway is not mistaken for a finished one. }
 function GameFilesPresent(Dir: String): Boolean;
@@ -290,14 +301,24 @@ begin
       WizardForm.FinishedLabel.Caption := 'Marvel vs. Capcom 2 was updated to version ' + NewVer + '.' + #13#10#13#10 +
         'Your game files, saves and settings were kept.';
   end;
+  if (CurPageID = wpFinished) and WantTexturePack and TexturePackInstalled then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'Hi-res textures are installed and on. To switch them off, use the Settings program (Textures tab) or F1 in the game.';
 end;
 
 { The "Ready to install" page says what is about to happen. }
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo, MemoComponentsInfo,
   MemoGroupInfo, MemoTasksInfo: String): String;
 var
-  S: String;
+  S, Pk: String;
 begin
+  Pk := '';
+  if WantTexturePack and TexturePackNeedsInstall then
+  begin
+    Pk := NewLine + NewLine + 'Hi-res texture pack, {#TextureDisplayVersion}' + NewLine + Space;
+    if TextureAllPartsLocal then Pk := Pk + 'Setup will check and use the texture archive beside it.'
+    else Pk := Pk + 'Setup will download the texture archive (about {#TextureDownloadBytes / 1000000} MB).';
+  end;
   if UpdateMode and GameFilesPresent(WizardDirValue) then
   begin
     if VerRel = 0 then
@@ -311,13 +332,13 @@ begin
     S := S + NewLine + Space + WizardDirValue + NewLine + NewLine +
          'Only the program files are replaced. Your game files, saves and settings are kept.';
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
-    Result := S;
+    Result := S + Pk;
   end else
   begin
     S := '';
     if MemoDirInfo <> '' then S := S + MemoDirInfo + NewLine + NewLine;
     if MemoTasksInfo <> '' then S := S + MemoTasksInfo + NewLine;
-    Result := S;
+    Result := S + Pk;
   end;
 end;
 
@@ -329,6 +350,7 @@ end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
 begin
+  TextureCancelButtonClick(Cancel, Confirm);
   if QuitNow then Confirm := False;      { Quit on the matching-version page: no "Exit Setup?" question }
 end;
 
@@ -349,6 +371,16 @@ begin
       MsgBox('Select an existing disc image or folder.', mbError, MB_OK);
       Result := False;
     end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var OtherBytes: Int64;
+begin
+  Result := '';
+  OtherBytes := 67108864;
+  if not GameFilesPresent(WizardDirValue) then
+    OtherBytes := OtherBytes + 300000000;      { the game files the importer copies }
+  Result := PrepareTexturePayload(OtherBytes);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -381,4 +413,26 @@ begin
         'Run Setup again and select a correct disc image or folder.', mbError, MB_OK);
     end;
   end;
+  if (CurStep = ssPostInstall) and GameFilesPresent(ExpandConstant('{app}')) then InstallTexturePack;
+  if CurStep = ssDone then TextureFinishCacheChoice;
+end;
+
+procedure DeinitializeSetup;
+begin
+  TextureCleanupOnExit;
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  Result := 0;
+  if not GameFilesPresent(ExpandConstant('{app}')) or (WantTexturePack and not TexturePackInstalled) then
+    Result := 1;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  { The texture pack's Programs and Features entry goes with the game (the pack has no uninstaller of its own). }
+  if CurUninstallStep = usPostUninstall then
+    RegDeleteKeyIncludingSubkeys(HKCU,
+      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#PackGuid}}_is1');
 end;
