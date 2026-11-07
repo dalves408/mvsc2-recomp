@@ -78,6 +78,21 @@ def manifest():
         }],
         'settings': settings,
         'saves': [DATA + '/SaveData'],
+        # Named places for the buttons below. 'saves' is the launcher's own name for the save folder.
+        'folders': {
+            'saves': [{'path': DATA + '/SaveData'}],
+            'data': [{'path': DATA}],
+            'textures': [{'path': '{install}/texture_pack'}],
+        },
+        'actions': [
+            {'id': 'open-saves', 'label': 'Open the save folder', 'open': 'saves'},
+            {'id': 'open-data', 'label': 'Open the settings folder', 'open': 'data',
+             'help': 'settings.ini: the video options and your keyboard keys ([keys]), also set by config.exe.'},
+            {'id': 'open-textures', 'label': 'Open the hi-res texture folder', 'open': 'textures',
+             'help': 'Where the texture pack installers put the hi-res textures.'},
+            {'id': 'clear-downloads', 'label': 'Delete saved texture downloads', 'clear': 'data/Downloads',
+             'help': 'The texture pack archives the installers kept for repairs. The installed textures stay.'},
+        ],
         'exit_codes': {
             '2': 'The disc image or folder could not be found.',
             '3': 'That file is not an Xbox disc image.',
