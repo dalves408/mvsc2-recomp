@@ -21,8 +21,25 @@ ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / 'build_release'
 INSTALLER = ROOT / 'installer'
 OUTPUT = INSTALLER / 'Output'
-ISCC = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Inno Setup 6' / 'ISCC.exe'
 WIZARD_SIZES = (55, 64, 80, 96, 128)
+
+
+def find_iscc():
+    """Inno Setup 6's compiler: --iscc or ISCC_EXE if given, else a per-user install (the default for a non-admin
+    install), else a machine-wide one, else ISCC on the PATH."""
+    places = [os.environ.get('ISCC_EXE', '')]
+    if os.environ.get('LOCALAPPDATA'):
+        places.append(str(Path(os.environ['LOCALAPPDATA']) / 'Programs' / 'Inno Setup 6' / 'ISCC.exe'))
+    places.append(str(Path.home() / 'AppData' / 'Local' / 'Programs' / 'Inno Setup 6' / 'ISCC.exe'))
+    for env in ('ProgramFiles(x86)', 'ProgramFiles'):
+        if os.environ.get(env):
+            places.append(str(Path(os.environ[env]) / 'Inno Setup 6' / 'ISCC.exe'))
+    places.append(shutil.which('ISCC') or '')
+    for place in places:
+        if place and Path(place).is_file():
+            return Path(place)
+    sys.exit('Inno Setup 6 (ISCC.exe) was not found. Install Inno Setup 6.4 or newer, or pass --iscc <path to ISCC.exe> '
+             '(or set ISCC_EXE). Looked in:\n  ' + '\n  '.join(p for p in places if p))
 
 
 def run(*command):
@@ -63,7 +80,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--version', required=True)
     parser.add_argument('--skip-build', action='store_true', help='use the programs already in build_release')
+    parser.add_argument('--iscc', help="Inno Setup 6's ISCC.exe, if it is not found by itself")
     args = parser.parse_args()
+    if args.iscc:
+        os.environ['ISCC_EXE'] = args.iscc
+    ISCC = find_iscc()
+    print(f'Inno Setup: {ISCC}', flush=True)
 
     for rc in ('mvc2.rc', 'config.rc'):
         set_rc_version(ROOT / 'resources' / rc, args.version)
