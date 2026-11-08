@@ -1,0 +1,281 @@
+diff --git a/src/kernel/kernel_rtl.c b/src/kernel/kernel_rtl.c
+--- a/src/kernel/kernel_rtl.c
++++ b/src/kernel/kernel_rtl.c
+@@ -186,11 +186,21 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
+  * Lazily created on first use rather than in RtlInitializeCriticalSection,
+  * because a title can perfectly well use a statically zeroed one it never
+  * announced.
++ *
++ * Xbox has no RtlDeleteCriticalSection. Titles that put locks inside heap
++ * objects therefore abandon shadow entries whenever those objects are freed at
++ * a new address. A fixed open-address table that never reclaims fills up, after
++ * which Enter becomes a no-op and the title races into a hang -- MvC2 does this
++ * after a few fights. Slots carry a refcount spanning Enter..Leave so idle
++ * abandoned entries can be deleted under the table lock without pulling a host
++ * CRITICAL_SECTION out from under a thread already on its way into it.
++ * Tombstones keep open-address probe chains intact across reclaim.
+  */
+ #define XBOX_CS_TABLE_SIZE 4096
++#define XBOX_CS_TOMBSTONE  ((uintptr_t)1)  /* guest CS pointers are aligned */
+ 
+ typedef struct {
+-    uintptr_t        key;        /* guest critical section; 0 means free */
++    uintptr_t        key;        /* guest CS; 0 free, 1 tombstone */
+     CRITICAL_SECTION cs;
+     /* Who holds it, and the guest call site that took it.
+      *
+@@ -203,6 +213,9 @@ typedef struct {
+     volatile uint32_t      owner_site;
+     volatile unsigned long owner_tid;
+     volatile long          depth;
++    /* Threads that have resolved this slot and not yet finished Enter..Leave
++     * (or a failed TryEnter). Reclaim skips any slot with refs != 0. */
++    volatile long          refs;
+ } XBOX_CS_SLOT;
+ 
+ static XBOX_CS_SLOT g_cs_table[XBOX_CS_TABLE_SIZE];
+@@ -219,6 +232,7 @@ static XBOX_CS_SLOT* xbox_cs_slot_of(CRITICAL_SECTION* cs)
+ }
+ static SRWLOCK      g_cs_table_lock = SRWLOCK_INIT;
+ static int          g_cs_table_full;
++static LONG         g_cs_reclaims;
+ 
+ /* RECOMP_CS_MODE=single puts every guest critical section behind one recursive
+  * lock.
+@@ -246,7 +260,7 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
+     return TRUE;
+ }
+ 
+-static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
++static int xbox_cs_single_enabled(void)
+ {
+     if (g_cs_single_mode < 0) {
+         const char* mode = getenv("RECOMP_CS_MODE");
+@@ -255,16 +269,77 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
+             fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
+                             "shares one recursive lock\n");
+     }
+-    if (g_cs_single_mode) {
+-        if (!guest)
+-            return NULL;
+-        InitOnceExecuteOnce(&g_cs_single_once, xbox_cs_single_init, NULL, NULL);
+-        return &g_cs_single;
++    return g_cs_single_mode;
++}
++
++/* Exclusive-lock only. Deletes host locks for abandoned guest keys that no
++ * thread currently holds a shadow reference on. */
++static int xbox_cs_reclaim_unheld(void)
++{
++    int n = 0;
++    size_t i;
++
++    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
++        XBOX_CS_SLOT* slot = &g_cs_table[i];
++        if (slot->key == 0 || slot->key == XBOX_CS_TOMBSTONE)
++            continue;
++        if (slot->refs != 0 || slot->depth != 0)
++            continue;
++        if (slot->cs.OwningThread != NULL)
++            continue;
++        DeleteCriticalSection(&slot->cs);
++        slot->owner_site = 0;
++        slot->owner_tid = 0;
++        slot->depth = 0;
++        slot->key = XBOX_CS_TOMBSTONE;
++        n++;
++    }
++    if (n) {
++        InterlockedAdd(&g_cs_reclaims, n);
++        g_cs_table_full = 0;
++        xbox_log(XBOX_LOG_INFO, XBOX_LOG_RTL,
++                 "critical-section table reclaimed %d idle shadow(s) "
++                 "(total %ld)", n, (long)g_cs_reclaims);
+     }
++    return n;
++}
++
++/* Publish a free or tombstone slot as key. Exclusive-lock only. */
++static CRITICAL_SECTION* xbox_cs_take_slot(XBOX_CS_SLOT* slot, uintptr_t key)
++{
++    if (slot->key == 0)
++        InitializeCriticalSection(&slot->cs);
++    else if (slot->key == XBOX_CS_TOMBSTONE)
++        InitializeCriticalSection(&slot->cs);
++    else
++        return &slot->cs;
++    slot->owner_site = 0;
++    slot->owner_tid = 0;
++    slot->depth = 0;
++    slot->refs = 0;
++    slot->key = key;             /* published last: a shared reader that sees
++                                  * the key sees a live lock behind it */
++    return &slot->cs;
++}
++
++/*
++ * create=0: look up only.
++ * create=1: insert if missing, reclaiming idle slots if the table is packed.
++ * retain=1: bump refs before returning (Enter / successful TryEnter path).
++ */
++static CRITICAL_SECTION* xbox_cs_shadow_ex(PRTL_CRITICAL_SECTION guest,
++                                          int create, int retain)
++{
+     uintptr_t key = (uintptr_t)guest;
+     CRITICAL_SECTION* found = NULL;
+     size_t home, i;
+ 
++    if (xbox_cs_single_enabled()) {
++        if (!guest)
++            return NULL;
++        InitOnceExecuteOnce(&g_cs_single_once, xbox_cs_single_init, NULL, NULL);
++        return &g_cs_single;
++    }
+     if (!key)
+         return NULL;
+     home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
+@@ -275,37 +350,82 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
+     AcquireSRWLockShared(&g_cs_table_lock);
+     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+         XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+-        if (slot->key == key) { found = &slot->cs; break; }
+-        if (slot->key == 0) break;
++        if (slot->key == key) {
++            if (retain)
++                InterlockedIncrement(&slot->refs);
++            found = &slot->cs;
++            break;
++        }
++        if (slot->key == 0)
++            break;
++        /* Tombstone: keep probing. */
+     }
+     ReleaseSRWLockShared(&g_cs_table_lock);
+-    if (found)
++    if (found || !create)
+         return found;
+ 
+     AcquireSRWLockExclusive(&g_cs_table_lock);
+     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+         XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+-        if (slot->key == key) { found = &slot->cs; break; }
+-        if (slot->key == 0) {
+-            InitializeCriticalSection(&slot->cs);
+-            slot->key = key;             /* published last: a shared reader
+-                                          * that sees the key sees a live
+-                                          * lock behind it */
++        if (slot->key == key) {
+             found = &slot->cs;
+             break;
+         }
++        if (slot->key == 0 || slot->key == XBOX_CS_TOMBSTONE) {
++            found = xbox_cs_take_slot(slot, key);
++            break;
++        }
+     }
++    if (!found && xbox_cs_reclaim_unheld()) {
++        /* Reclaim may have opened a tombstone on our probe chain; retry
++         * the insert while still holding the exclusive lock. */
++        for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
++            XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
++            if (slot->key == key) {
++                found = &slot->cs;
++                break;
++            }
++            if (slot->key == 0 || slot->key == XBOX_CS_TOMBSTONE) {
++                found = xbox_cs_take_slot(slot, key);
++                break;
++            }
++        }
++    }
++    if (found && retain)
++        InterlockedIncrement(&xbox_cs_slot_of(found)->refs);
+     ReleaseSRWLockExclusive(&g_cs_table_lock);
+ 
+     if (!found && !g_cs_table_full) {
+         g_cs_table_full = 1;
+         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_RTL,
+-                 "critical-section table full at %d entries; further locks "
+-                 "are unprotected", XBOX_CS_TABLE_SIZE);
++                 "critical-section table full at %d entries after reclaim; "
++                 "further locks are unprotected", XBOX_CS_TABLE_SIZE);
+     }
+     return found;
+ }
+ 
++static CRITICAL_SECTION* xbox_cs_acquire(PRTL_CRITICAL_SECTION guest)
++{
++    return xbox_cs_shadow_ex(guest, 1, 1);
++}
++
++static CRITICAL_SECTION* xbox_cs_ensure(PRTL_CRITICAL_SECTION guest)
++{
++    return xbox_cs_shadow_ex(guest, 1, 0);
++}
++
++static CRITICAL_SECTION* xbox_cs_find(PRTL_CRITICAL_SECTION guest)
++{
++    return xbox_cs_shadow_ex(guest, 0, 0);
++}
++
++static void xbox_cs_release(CRITICAL_SECTION* cs)
++{
++    XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
++    if (slot)
++        InterlockedDecrement(&slot->refs);
++}
++
+ /* Contention is worth saying out loud.
+  *
+  * Now that these locks are real, a title that leaks one -- or a thread of ours
+@@ -472,7 +592,7 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
+ 
+ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+ {
+-    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
++    CRITICAL_SECTION* cs = xbox_cs_acquire(CriticalSection);
+     if (!cs)
+         return;
+     InterlockedIncrement(&g_cs_enters);
+@@ -529,9 +649,13 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
+  * a host lock the thread never took, which can free it under its real holder. */
+ BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+ {
+-    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+-    if (!cs || !TryEnterCriticalSection(cs))
++    CRITICAL_SECTION* cs = xbox_cs_acquire(CriticalSection);
++    if (!cs)
++        return FALSE;
++    if (!TryEnterCriticalSection(cs)) {
++        xbox_cs_release(cs);
+         return FALSE;
++    }
+     InterlockedIncrement(&g_cs_enters);
+     crt_lock_trace("take", CriticalSection);
+     xbox_cs_note_owner(cs);
+@@ -540,12 +664,15 @@ BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION Critical
+ 
+ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+ {
+-    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
++    /* Find only: Leave must not invent a shadow for a guest lock we never
++     * Enter'd, and must drop the ref Enter/TryEnter took. */
++    CRITICAL_SECTION* cs = xbox_cs_find(CriticalSection);
+     if (cs) {
+         InterlockedIncrement(&g_cs_leaves);
+         crt_lock_trace("drop", CriticalSection);
+         xbox_cs_clear_owner(cs);
+         LeaveCriticalSection(cs);
++        xbox_cs_release(cs);
+     }
+ }
+ 
+@@ -553,7 +680,7 @@ VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalS
+ {
+     /* Creating the shadow here is not required -- Enter does it -- but doing
+      * it now keeps the first Enter off the exclusive path. */
+-    (void)xbox_cs_shadow(CriticalSection);
++    (void)xbox_cs_ensure(CriticalSection);
+ }
+ 
+ /* ============================================================================
