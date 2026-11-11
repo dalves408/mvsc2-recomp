@@ -87,6 +87,7 @@ build_release.log
 !/scripts/build_installer.py
 !/scripts/recomplauncher_manifest.py
 !/scripts/build_texture_pack.py
+!/scripts/symbolize_log.py
 /src/mvc2_debug.c
 /src/mvc2_watch.c
 *.log

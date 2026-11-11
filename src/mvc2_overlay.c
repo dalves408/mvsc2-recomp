@@ -363,6 +363,8 @@ static void close_overlay(void)
 
 static void quit_game(void)
 {
+    extern void mvc2_diag_flush(void);
+    mvc2_diag_flush();                              /* the log file gets the last lines first */
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
@@ -509,6 +511,9 @@ static void tick(void)
 }
 
 /* The pushbuffer thread, at the end of every flip. */
+/* The game is paused while a menu is up, so no new frame then is not a freeze (mvc2_diag.c). */
+int mvc2_overlay_active(void) { return s_active; }
+
 void mvc2_overlay_flip_wait(void)
 {
     while (s_active)

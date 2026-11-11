@@ -41,6 +41,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "mvc2_debug.h"
+#include "mvc2_diag.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -314,10 +315,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         /* Print native stack return addresses for debugging */
         {
             uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
-            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
+            char where[200];
+            mvc2_diag_where((const void *)(uintptr_t)ep->ContextRecord->Rip, where, sizeof where);
+            fprintf(stderr, "  at %s\n  Native stack (return addresses into the game):\n", where);
             for (int i = 0; i < 64 && sp[i]; i++) {
                 if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+                    mvc2_diag_where((const void *)(uintptr_t)sp[i], where, sizeof where);
+                    fprintf(stderr, "    [%d] %s\n", i, where);
                 }
             }
         }
@@ -329,93 +333,11 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 }
 
 /* ── WinMain ───────────────────────────────────────────────── */
-/* RECOMP_STALL_DUMP=<secs>: when no frame has been flipped for that long, write the native stack of every thread
- * (recompiled guest functions are native frames named sub_XXXXXXXX, so this IS the guest call chain per thread) and
- * keep doing it every <secs> while the stall lasts. Written with WriteFile so a thread suspended inside fprintf
- * cannot deadlock the dump. */
-#include <tlhelp32.h>
-extern uint32_t mvc2_gpu_flips(void);
-static void sd_put(const char *s) { DWORD n; WriteFile(GetStdHandle(STD_ERROR_HANDLE), s, (DWORD)strlen(s), &n, NULL); }
-static void sd_dump_threads(void)
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    THREADENTRY32 te; char line[512];
-    HANDLE me = GetCurrentProcess(); DWORD mytid = GetCurrentThreadId();
-    if (snap == INVALID_HANDLE_VALUE) return;
-    te.dwSize = sizeof(te);
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-        HANDLE th; CONTEXT ctx; STACKFRAME64 sf; int depth = 0;
-        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == mytid) continue;
-        th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-        if (!th) continue;
-        if (SuspendThread(th) == (DWORD)-1) { CloseHandle(th); continue; }
-        memset(&ctx, 0, sizeof(ctx)); ctx.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(th, &ctx)) {
-            memset(&sf, 0, sizeof(sf));
-            sf.AddrPC.Offset = ctx.Rip; sf.AddrPC.Mode = AddrModeFlat;
-            sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
-            sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
-            snprintf(line, sizeof(line), "[STALL] thread %lu:", (unsigned long)te.th32ThreadID); sd_put(line);
-            while (depth < 14 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, me, th, &sf, &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) {
-                char buf[sizeof(SYMBOL_INFO) + 128]; SYMBOL_INFO *sym = (SYMBOL_INFO *)buf; DWORD64 d = 0;
-                memset(buf, 0, sizeof(buf)); sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 127;
-                if (SymFromAddr(me, sf.AddrPC.Offset, &d, sym)) snprintf(line, sizeof(line), " %s+%llX", sym->Name, (unsigned long long)d);
-                else snprintf(line, sizeof(line), " ?%llX", (unsigned long long)sf.AddrPC.Offset);
-                sd_put(line); depth++;
-                if (!sf.AddrPC.Offset) break;
-            }
-            sd_put("\n");
-        }
-        ResumeThread(th); CloseHandle(th);
-    }
-    CloseHandle(snap);
-}
-static DWORD WINAPI sd_thread(LPVOID u)
-{
-    unsigned secs = (unsigned)(uintptr_t)u, still = 0; uint32_t last = mvc2_gpu_flips(); char line[512];
-    for (;;) {
-        Sleep(1000);
-        uint32_t now = mvc2_gpu_flips();
-        if (now != last || now == 0) { last = now; still = 0; continue; }
-        if (++still % secs == 0) {
-            snprintf(line, sizeof(line), "[STALL] no flip for %u s (flips=%u)\n", still, now); sd_put(line);
-            { extern void xbox_rt_dump(void);
-              const uint8_t *gm = (const uint8_t *)g_xbox_mem_offset;
-              if (gm) { uint32_t a[10]; int k; __try { for (k = 0; k < 10; k++) a[k] = *(const volatile uint32_t *)(gm + 0x593BA8u + 4u*k); } __except (EXCEPTION_EXECUTE_HANDLER) { memset(a, 0xEE, sizeof a); }
-                snprintf(line, sizeof(line), "[STALLMEM] 593BA8..: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n", a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],a[8],a[9]); sd_put(line); }
-              xbox_rt_dump(); }
-            { /* [STALLD3D]: the D3D pushbuffer-space wait (sub_002895C0: KeWait on device+0x1964) */
-              extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
-              const uint8_t *gm = (const uint8_t *)g_xbox_mem_offset;
-              if (gm) {
-                uint32_t dev = 0, a17 = 0, a4 = 0, g1 = 0, g2 = 0, ev[6] = {0}, df[11] = {0}; int k;
-                __try {
-                    dev = *(const volatile uint32_t *)(gm + 0x2930F8u);
-                    if (dev > 0x10000u && dev < 0x04000000u) {
-                        a17 = *(const volatile uint32_t *)(gm + dev + 0x17BCu);
-                        if (a17 >= 0xFD000000u) { volatile uint32_t *p = xbox_Nv2aRegPtr(a17 - 0xFD000000u + 0x44u); if (p) g1 = *p; } else if (a17 > 0x10000u && a17 < 0x04000000u) g1 = *(const volatile uint32_t *)(gm + a17 + 0x44u);
-                        { a4 = *(const volatile uint32_t *)(gm + dev + 0x4F8u);
-                          if (a4 >= 0xFD000000u) { volatile uint32_t *p = xbox_Nv2aRegPtr(a4 - 0xFD000000u + 0x324Cu); if (p) g2 = *p; } else if (a4 > 0x10000u && a4 < 0x04000000u) g2 = *(const volatile uint32_t *)(gm + a4 + 0x324Cu); }
-                        for (k = 0; k < 6; k++) ev[k] = *(const volatile uint32_t *)(gm + 0x294A64u + 4u*k);
-                        { static const uint32_t o[11] = {0x00,0x24,0x28,0x2C,0x30,0x40,0x15AC,0x1DF8,0x1960,0x1FD8,0x1964};
-                          for (k = 0; k < 11; k++) df[k] = *(const volatile uint32_t *)(gm + dev + o[k]); }
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) { dev = 0xEEEEEEEEu; }
-                snprintf(line, sizeof(line), "[STALLD3D] dev=%08X dev+17BC=%08X dev+4F8=%08X GET(usr)=%08X GET(324C)=%08X\n", dev, a17, a4, g1, g2); sd_put(line);
-                snprintf(line, sizeof(line), "[STALLD3D] KEVENT@294A64: %08X %08X %08X %08X %08X %08X\n", ev[0],ev[1],ev[2],ev[3],ev[4],ev[5]); sd_put(line);
-                snprintf(line, sizeof(line), "[STALLD3D] dev+00/24/28/2C/30/40/15AC/1DF8/1960/1FD8/1964: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n", df[0],df[1],df[2],df[3],df[4],df[5],df[6],df[7],df[8],df[9],df[10]); sd_put(line);
-                { static const uint32_t r[] = {0x100,0x140,0x400100,0x400140,0x400B10,0x100410,0x3240,0x3244,0x800040,0x800044,0x600100,0x600140};
-                  int n = snprintf(line, sizeof(line), "[STALLD3D] NV2A");
-                  for (k = 0; k < (int)(sizeof r/sizeof r[0]); k++) { volatile uint32_t *p = xbox_Nv2aRegPtr(r[k]);
-                      if (p) n += snprintf(line + n, sizeof(line) - n, " %X=%08X", (unsigned)r[k], (unsigned)*p); else n += snprintf(line + n, sizeof(line) - n, " %X=n/a", (unsigned)r[k]); }
-                  snprintf(line + n, sizeof(line) - n, "\n"); sd_put(line); }
-              } }
-            { extern void xbox_SwMethodDump(FILE *f); xbox_SwMethodDump(stderr); fflush(stderr); }
-            sd_dump_threads();
-        }
-    }
-    return 0;
-}
+/* Freeze and crash reports, and the player build's log file: mvc2_diag.c. RECOMP_STALL_DUMP=<secs> (developer builds)
+ * repeats the freeze report every <secs> with the long Direct3D and pushbuffer dumps. */
+#include "platform/recomp_exit_hook.h"
+static void diag_on_exit(const char *why) { (void)why; mvc2_diag_flush(); }
+
 /* MVC2_SCAN debug: find copies of the XID pad report in guest memory. */
 static DWORD WINAPI mvc2_scan_thread(LPVOID u)
 {
@@ -495,6 +417,7 @@ static void player_setup(void)
         strcpy(base, ".");
     snprintf(path, sizeof path, "%s\\MvC2Recomp", base);
     CreateDirectoryA(path, NULL);
+    mvc2_diag_log_start(path);          /* from here on everything printed is also in MvC2Recomp\logs */
     snprintf(s_player_ini, sizeof s_player_ini, "%s\\MvC2Recomp\\settings.ini", base);
     snprintf(s_partition_dir, sizeof s_partition_dir, "%s\\MvC2Recomp\\Partitions", base);
     snprintf(path, sizeof path, "%s\\MvC2Recomp\\SaveData", base);
@@ -557,7 +480,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     { extern void mvc2_keymap_init(void); mvc2_keymap_init(); }     /* the player's keys from config.exe */
     { extern void mvc2_overlay_init(void); mvc2_overlay_init(); }   /* ESC quit prompt, F1 settings */
     { extern void xbox_set_vblank_hz(unsigned hz); const char *hz = getenv("RECOMP_VBLANK_HZ"); if (hz) xbox_set_vblank_hz((unsigned)atoi(hz)); }
-    { const char *sdv = getenv("RECOMP_STALL_DUMP"); if (sdv && atoi(sdv) > 0) CreateThread(NULL, 0, sd_thread, (LPVOID)(uintptr_t)atoi(sdv), 0, NULL); }
+    { const char *sdv = getenv("RECOMP_STALL_DUMP");
+      if (sdv && atoi(sdv) > 0) mvc2_diag_start((unsigned)atoi(sdv), 1);
+      else mvc2_diag_start(10, 0); }       /* the freeze report: no frame for 10 s */
+    recomp_exit_hook_set(diag_on_exit);
     /* Unbuffered stdout for immediate visibility during debugging. stderr is buffered: unbuffered, every
      * fprintf did a WriteFile while holding the CRT stream lock, and the pushbuffer thread (which the
      * game's KickOff waits on ~14 times a frame) spent ~94% of a fight waiting for that lock.
@@ -587,6 +513,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    mvc2_diag_install_crash_filter();
+    mvc2_diag_build_line();
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {

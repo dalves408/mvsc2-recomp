@@ -23,6 +23,14 @@ if(MVC2_RELEASE)
         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
     endif()
     add_compile_definitions(MVC2_RELEASE=1)
+    # Symbols for every release, kept on the build PC and never shipped: a player's freeze or crash report gives code
+    # offsets, and scripts/symbolize_log.py names them with this .pdb (build_installer.py copies it to out/symbols).
+    # /OPT:REF and /OPT:ICF keep the code the same as without /DEBUG. The game's /PDBALTPATH is set on its target below.
+    if(MSVC)
+        string(APPEND CMAKE_C_FLAGS_RELEASE " /Zi /FS")
+        string(APPEND CMAKE_CXX_FLAGS_RELEASE " /Zi /FS")
+        string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
+    endif()
 endif()
 
 # Common definitions
@@ -65,6 +73,7 @@ set(GAME_SOURCES
     src/gpu_backend.c
     src/mvc2_overlay.c
     src/mvc2_keymap.c
+    src/mvc2_diag.c
     src/sprite_filter.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
@@ -117,6 +126,10 @@ if(MSVC)
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:/bigobj>)
+    # The exe names its .pdb without the build folder (%_PDB% does not survive MSBuild's escaping).
+    if(MVC2_RELEASE)
+        target_link_options(${PROJECT_NAME} PRIVATE /PDBALTPATH:mvc2_recomp.pdb)
+    endif()
 endif()
 
 # ── Debug flavour: the xrdbg self-monitoring kit (tools/xrdbg) ───
@@ -166,7 +179,7 @@ if(MVC2_RELEASE)
     target_link_libraries(mvc2_import PRIVATE bcrypt shell32)
     add_executable(mvc2_config WIN32 installer/config.c resources/config.rc)
     target_include_directories(mvc2_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(mvc2_config PRIVATE comctl32 user32 gdi32 shell32)
+    target_link_libraries(mvc2_config PRIVATE comctl32 user32 gdi32 shell32 version advapi32)
     set_target_properties(mvc2_config PROPERTIES OUTPUT_NAME config)
     # The installers' download helper for the hi-res texture pack (not installed; Setup runs it from its temp folder).
     add_executable(mvc2_texture_download installer/texture_download.c)

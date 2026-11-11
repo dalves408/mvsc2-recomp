@@ -5,7 +5,9 @@
  * Controls tab: a keyboard remapper. Each Xbox control has a key and an alternate key, saved in [keys]
  * (see src/mvc2_keymap.h).
  * Textures tab: the hi-res texture pack's on/off switch ([display] hires_textures, the F1 menu's Hi-res textures),
- * greyed out with a download button when the pack is not installed. */
+ * greyed out with a download button when the pack is not installed.
+ * Report a problem: opens the logs folder (the game's own logs, %LOCALAPPDATA%\MvC2Recomp\logs) with the newest
+ * selected, and a new GitHub issue filled in with the game version and the PC. */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -76,7 +78,7 @@ static const VideoOpt VIDEO[NVIDEO] = {
 };
 
 enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200,
-       ID_TEX_MASTER = 300, ID_TEX_DL = 320 };
+       ID_TEX_MASTER = 300, ID_TEX_DL = 320, ID_REPORT = 330 };
 enum { PAGE_VIDEO, PAGE_CONTROLS, PAGE_TEXTURES };
 
 static int s_tex_on = 1, s_tex_installed;
@@ -386,7 +388,8 @@ static void make_ui(HWND h)
     struct { int id; const char *t; int x; int w; } cb[] = {
         { ID_CHANGE, "Change key", 20, 100 }, { ID_ALT, "Change alternate", 126, 120 }, { ID_CLEAR, "Clear", 252, 70 } };
     struct { int id; const char *t; int x; int w; } bb[] = {
-        { ID_RESET, "Reset to defaults", 10, 130 }, { ID_SAVE, "Save", 444, 70 }, { ID_CLOSE, "Close", 520, 70 } };
+        { ID_RESET, "Reset to defaults", 10, 130 }, { ID_REPORT, "Report a problem...", 150, 140 },
+        { ID_SAVE, "Save", 444, 70 }, { ID_CLOSE, "Close", 520, 70 } };
 
     s_tab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
                             10, 10, 580, 540, h, (HMENU)(INT_PTR)ID_TAB, NULL, NULL);
@@ -453,9 +456,118 @@ static void make_ui(HWND h)
 
     /* below the tabs: status line and the buttons for every page */
     s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 558, 580, 34, ID_STATUS, f);
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < 4; i++)
         mk("BUTTON", bb[i].t, WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, bb[i].x, 596, bb[i].w, 28, bb[i].id, f);
     show_page(PAGE_VIDEO);
+}
+
+/* ---- Report a problem ------------------------------------------------------------------------------------------------
+ * Opens the logs folder with the newest log selected, and a new GitHub issue filled in with the game version and the PC.
+ * The player describes the problem and drags the log onto the page (GitHub needs a free account). RecompLauncher's own
+ * report button sends the same log without either. */
+static void url_append(char *out, size_t n, const char *s)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = strlen(out);
+    for (; *s && o + 4 < n; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || strchr("-_.~", c)) {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 15];
+        }
+    }
+    out[o] = 0;
+}
+
+static void reg_str(HKEY root, const char *key, const char *name, char *out, DWORD n)
+{
+    HKEY k;
+    if (!RegOpenKeyExA(root, key, 0, KEY_READ, &k)) {
+        if (RegQueryValueExA(k, name, NULL, NULL, (BYTE *)out, &n)) out[0] = 0;
+        RegCloseKey(k);
+    }
+}
+
+static void do_report(HWND h)
+{
+    char base[MAX_PATH], logs[MAX_PATH], newest[MAX_PATH] = "", pat[MAX_PATH], exe[MAX_PATH], *slash;
+    char ver[32] = "?", cpu[96] = "?", gpu[128] = "?", osname[64] = "Windows", disp[16] = "", build[16] = "";
+    char body[2048], url[8192], arg[MAX_PATH + 16];
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+    DISPLAY_DEVICEA dev;
+    MEMORYSTATUSEX ms;
+    DWORD i, sz, hnd;
+
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base)) strcpy(base, ".");
+    snprintf(logs, sizeof logs, "%s\\MvC2Recomp", base);
+    CreateDirectoryA(logs, NULL);
+    snprintf(logs, sizeof logs, "%s\\MvC2Recomp\\logs", base);
+    CreateDirectoryA(logs, NULL);
+    snprintf(pat, sizeof pat, "%s\\mvc2-*.log", logs);
+    if ((f = FindFirstFileA(pat, &fd)) != INVALID_HANDLE_VALUE) {
+        do { if (strcmp(fd.cFileName, newest) > 0) snprintf(newest, sizeof newest, "%s", fd.cFileName); }
+        while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+
+    /* the game's version, from mvc2_recomp.exe beside this program */
+    if (GetModuleFileNameA(NULL, exe, sizeof exe) && (slash = strrchr(exe, '\\')) != NULL) {
+        strcpy(slash + 1, "mvc2_recomp.exe");
+        if ((sz = GetFileVersionInfoSizeA(exe, &hnd)) != 0) {
+            void *vi = malloc(sz);
+            VS_FIXEDFILEINFO *ff;
+            UINT len;
+            if (vi && GetFileVersionInfoA(exe, 0, sz, vi) && VerQueryValueA(vi, "\\", (void **)&ff, &len) && ff)
+                snprintf(ver, sizeof ver, "%u.%u.%u", HIWORD(ff->dwFileVersionMS), LOWORD(ff->dwFileVersionMS),
+                         HIWORD(ff->dwFileVersionLS));
+            free(vi);
+        }
+    }
+    reg_str(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString", cpu, sizeof cpu);
+    reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName", osname, sizeof osname);
+    reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion", disp, sizeof disp);
+    reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuild", build, sizeof build);
+    if (atoi(build) >= 22000 && !strncmp(osname, "Windows 10", 10)) osname[8] = '1';   /* 11 still says "10" there */
+    memset(&dev, 0, sizeof dev);
+    dev.cb = sizeof dev;
+    for (i = 0; EnumDisplayDevicesA(NULL, i, &dev, 0); i++)
+        if (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) { snprintf(gpu, sizeof gpu, "%s", dev.DeviceString); break; }
+    ms.dwLength = sizeof ms;
+    GlobalMemoryStatusEx(&ms);
+
+    snprintf(body, sizeof body,
+             "**What happened?**\n\n\n"
+             "**What were you doing just before?** (menus, a fight, after losing, changing settings...)\n\n\n"
+             "**Log:** drag the selected file from the logs folder that just opened (%s) into this box.\n\n"
+             "---\nGame %s | %s %s (build %s) | %s | %s | %llu GB\n",
+             newest[0] ? newest : "mvc2-....log", ver, osname, disp, build, cpu, gpu,
+             (unsigned long long)((ms.ullTotalPhys + (1ull << 29)) >> 30));
+    strcpy(url, "https://github.com/dalves408/mvsc2-recomp/issues/new?title=");
+    url_append(url, sizeof url, "Problem: ");
+    strcat(url, "&body=");
+    url_append(url, sizeof url, body);
+
+    if (newest[0]) {
+        snprintf(arg, sizeof arg, "/select,\"%s\\%s\"", logs, newest);
+        ShellExecuteA(h, "open", "explorer.exe", arg, NULL, SW_SHOWNORMAL);
+    } else {
+        ShellExecuteA(h, "open", logs, NULL, NULL, SW_SHOWNORMAL);
+    }
+    ShellExecuteA(h, "open", url, NULL, NULL, SW_SHOWNORMAL);
+    MessageBoxA(h, newest[0]
+                ? "Two windows opened:\n\n"
+                  "  - your logs folder, with the newest log selected\n"
+                  "  - a new problem report on GitHub (it needs a free GitHub account)\n\n"
+                  "Say what happened, then drag the selected log file onto the report and submit it.\n\n"
+                  "The log is from the last time the game ran, so report right after the problem. It holds no personal "
+                  "information: your Windows user name is blanked out.\n\n"
+                  "Using RecompLauncher? Its own report button sends the log for you."
+                : "Your logs folder and a new problem report on GitHub opened. There is no log yet: play until the problem "
+                  "happens, then click Report a problem again.",
+                TITLE, MB_ICONINFORMATION);
+    status("The logs folder and the problem report page opened.");
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -500,6 +612,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             status("Cleared. That action has no key until you assign one.");
             return 0;
         }
+        case ID_REPORT: do_report(h); return 0;
         case ID_RESET: do_reset(); return 0;
         case ID_SAVE:  do_save(); return 0;
         case ID_CLOSE: PostMessageA(h, WM_CLOSE, 0, 0); return 0;

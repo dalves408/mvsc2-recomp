@@ -50,6 +50,15 @@ The game pauses while a menu is open. In a menu, Up/Down chooses, Left/Right cha
 
 Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`: the video options and the hi-res texture switch in `[display]`, your keys in `[keys]`. Saves are in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting; `desktop` uses the saved setting.
 
+## Reporting a problem
+
+Each run writes a log to `%LOCALAPPDATA%\MvC2Recomp\logs` (the last three runs are kept). If the game freezes for 10 seconds or crashes, the log also records where each part of the game was at that moment, which is usually enough to find the cause. Logging runs in the background and doesn't affect the game's speed. Your Windows user name is blanked out in the log.
+
+- **RecompLauncher:** its report button sends the newest log for you.
+- **Otherwise:** click **Report a problem** in the settings program (`config.exe`). It opens the logs folder with the newest log selected, and a new [GitHub issue](https://github.com/dalves408/mvsc2-recomp/issues) already filled in with the game version and your PC details. Say what happened, drag the log onto the page and submit it. GitHub needs a free account.
+
+Report right after the problem, before starting the game again three more times, or the log will be gone.
+
 ## Building
 
 You need Windows 10 or 11 x64, Visual Studio 2022 C++ Build Tools, CMake, Python 3.12 with `capstone`, and your own copy of the game. To build the installer you also need Inno Setup 6 and Pillow.
@@ -88,7 +97,7 @@ python scripts\build_texture_pack.py --source <folder of .dds files> --revision 
 python scripts\build_installer.py --version 1.0.0
 ```
 
-This builds the player version in `build_release`, with the C runtime linked in and developer switches ignored. `build_texture_pack.py` packs the hi-res textures into 7z `.bin` parts under 2 GB each and writes their sizes, SHA-256 and download links to `installer\texture_payload.iss`. `build_installer.py` then writes `MvC2-Setup-<version>.exe`, the texture addon `MvC2-HiRes-Textures-<n>-Setup.exe`, a RecompLauncher ZIP and the `.bin` parts to `installer\Output`. They contain code or art from the game, so they must not be committed: the `.bin` parts go on a `textures-<n>` release, the rest on the game's release.
+This builds the player version in `build_release`, with the C runtime linked in and developer switches ignored. It also keeps that build's `mvc2_recomp.exe` and `.pdb` in `out\symbols\<version>`. They are never shipped, but `python scripts\symbolize_log.py <log>` uses them to turn the code offsets in a player's freeze or crash report into function names. `build_texture_pack.py` packs the hi-res textures into 7z `.bin` parts under 2 GB each and writes their sizes, SHA-256 and download links to `installer\texture_payload.iss`. `build_installer.py` then writes `MvC2-Setup-<version>.exe`, the texture addon `MvC2-HiRes-Textures-<n>-Setup.exe`, a RecompLauncher ZIP and the `.bin` parts to `installer\Output`. They contain code or art from the game, so they must not be committed: the `.bin` parts go on a `textures-<n>` release, the rest on the game's release.
 
 ## How it works
 

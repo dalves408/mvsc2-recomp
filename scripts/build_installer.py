@@ -70,6 +70,20 @@ def wizard_images():
         canvas.convert('RGB').save(INSTALLER / f'wizard_small_{size}.bmp')
 
 
+def keep_symbols(version):
+    """The exe and its .pdb, kept on this PC and never shipped: scripts/symbolize_log.py names the code offsets in a
+    player's [FREEZE] or [CRASH] report with them. out/ is git-ignored."""
+    release = BUILD / 'Release'
+    pdb = release / 'mvc2_recomp.pdb'
+    if not pdb.is_file():
+        sys.exit(f'{pdb} is missing: the release build makes it (CMakeLists.txt, MVC2_RELEASE)')
+    keep = ROOT / 'out' / 'symbols' / version
+    keep.mkdir(parents=True, exist_ok=True)
+    for name in ('mvc2_recomp.exe', 'mvc2_recomp.pdb'):
+        shutil.copyfile(release / name, keep / name)
+    print(f'Symbols kept in {keep}', flush=True)
+
+
 def write_sha256(path):
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     path.with_name(path.name + '.sha256').write_text(f'{digest}  {path.name}\n')
@@ -93,6 +107,7 @@ def main():
         run('cmake', '-S', ROOT, '-B', BUILD, '-DMVC2_RELEASE=ON')
         run('cmake', '--build', BUILD, '--config', 'Release', '-j', '12', '--target', 'mvc2_recomp', 'mvc2_import', 'mvc2_config',
             'mvc2_texture_download')
+    keep_symbols(args.version)
     wizard_images()
     OUTPUT.mkdir(exist_ok=True)
     run(ISCC, f'/DAppVersion={args.version}', INSTALLER / 'mvc2.iss')

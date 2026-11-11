@@ -83,6 +83,9 @@ def manifest():
             'saves': [{'path': DATA + '/SaveData'}],
             'data': [{'path': DATA}],
             'textures': [{'path': '{install}/texture_pack'}],
+            # The game's own log, one file per run, the last three kept (src/mvc2_diag.c). The launcher puts the newest
+            # .log from here in the crash report a player sends.
+            'logs': [{'path': DATA + '/logs'}],
         },
         'actions': [
             {'id': 'open-saves', 'label': 'Open the save folder', 'open': 'saves'},
@@ -90,6 +93,8 @@ def manifest():
              'help': 'settings.ini: the video options and your keyboard keys ([keys]), also set by config.exe.'},
             {'id': 'open-textures', 'label': 'Open the hi-res texture folder', 'open': 'textures',
              'help': 'Where the texture pack installers put the hi-res textures.'},
+            {'id': 'open-logs', 'label': 'Open the logs folder', 'open': 'logs',
+             'help': 'One log per run, the last three kept. Attach the newest to a problem report.'},
             {'id': 'clear-downloads', 'label': 'Delete saved texture downloads', 'clear': 'data/Downloads',
              'help': 'The texture pack archives the installers kept for repairs. The installed textures stay.'},
         ],
