@@ -5,6 +5,9 @@
  *                 The last three runs are kept, a log stops taking routine lines at 20 MB, the long per-texture and
  *                 per-method tables are left out, and the Windows user name is replaced by %USERPROFILE%/%USERNAME%.
  *   [BUILD]       one line at start: version, symbol-file id, Windows, CPU, GPU, memory.
+ *   [VIDEO]       every video setting in effect, the window size and the monitor's refresh rate: once when the game
+ *                 is up, when a setting changes during play (the settings menu closing with something changed, F11 or
+ *                 Alt+Enter: mvc2_overlay.c), and in every freeze or crash report. Nothing polls for it.
  *   [FREEZE]      no frame for 10 s while no menu is open: every thread's call stack as module+offset (and symbol, when
  *                 a .pdb is beside the exe), the streaming worker's state and the resume tokens; again 20 s later; a
  *                 line when frames move again. scripts/symbolize_log.py turns the offsets into function names with the
@@ -30,6 +33,8 @@
 extern uint32_t mvc2_gpu_flips(void);
 extern int mvc2_overlay_active(void);
 extern void xbox_rt_dump(void);
+extern void mvc2_overlay_video_line(char *out, size_t n);
+extern void mvc2_overlay_log_video(const char *why);
 extern ptrdiff_t g_xbox_mem_offset;
 
 #define LOG_KEEP 3                  /* runs kept, this one included */
@@ -378,6 +383,16 @@ void mvc2_diag_build_line(void)
            (unsigned long)si.dwNumberOfProcessors, gpu, (unsigned long long)((ms.ullTotalPhys + (1ull << 29)) >> 30)); }
 }
 
+/* ---- [VIDEO] ------------------------------------------------------------------------------------------------------- */
+static void video_line(const char *why)
+{
+    char line[600];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    mvc2_overlay_video_line(line, sizeof line);
+    putf("[VIDEO] %02d:%02d:%02d %s: %s\n", st.wHour, st.wMinute, st.wSecond, why, line);
+}
+
 /* ---- [FREEZE] ------------------------------------------------------------------------------------------------------ */
 static ULONGLONG s_t0;
 
@@ -461,6 +476,7 @@ static void freeze_report(unsigned secs, uint32_t frames, int verbose)
     putf("[FREEZE] no new frame for %u s (frames so far %u, %lu s since start)\n", secs, frames,
          (unsigned long)((GetTickCount64() - s_t0) / 1000));
     mvc2_diag_build_line();
+    video_line("at the freeze");
     guest_state(verbose);
     dump_threads();
     if (verbose) { extern void xbox_SwMethodDump(FILE *f); xbox_SwMethodDump(stderr); fflush(stderr); }
@@ -477,11 +493,16 @@ static DWORD WINAPI watch_thread(LPVOID p)
 {
     uint32_t last = mvc2_gpu_flips();
     unsigned still = 0, reports = 0, total = 0;
+    int video_logged = 0;
     (void)p;
     for (;;) {
         uint32_t now;
         Sleep(1000);
         now = mvc2_gpu_flips();
+        if (now && !video_logged) {             /* once: the settings in use when the game is up */
+            mvc2_overlay_log_video("start");
+            video_logged = 1;
+        }
         if (now != last || now == 0 || mvc2_overlay_active()) {
             if (reports && now != last)
                 putf("[FREEZE] frames are moving again after %u s\n", still);
@@ -524,6 +545,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
     n = unwind(&ctx, pcs, MAX_FRAMES);
     put_stack("[CRASH]", GetCurrentThreadId(), pcs, n);
     mvc2_diag_build_line();
+    video_line("at the crash");
     mvc2_diag_flush();
     return EXCEPTION_CONTINUE_SEARCH;
 }

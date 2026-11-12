@@ -22,6 +22,7 @@
 extern HWND xbox_fb_window(void);
 extern int  xbox_fb_is_fullscreen(void);
 extern void xbox_fb_toggle_fullscreen(void);
+extern void (*xbox_fb_fullscreen_changed)(int);
 extern int  (*xbox_fb_key_hook)(unsigned vk, long lparam, int down);
 extern void (*xbox_fb_tick_hook)(void);
 extern void xbox_InputKeysClear(void);
@@ -38,6 +39,7 @@ static int s_pad_valid, s_unblock_wait, s_chord_held;
 static DWORD s_unblock_t;
 
 static int s_scale = 1, s_stretch, s_vsync = 1, s_upscaling, s_hires = 1, s_sprite, s_smooth, s_sharpen;
+static void log_video(const char *why);
 
 /* ---- settings.ini ------------------------------------------------------- */
 
@@ -357,6 +359,7 @@ static void close_overlay(void)
         s_unblock_wait = 1;                         /* pads stay neutral until the buttons are let go */
         s_unblock_t = GetTickCount();
     }
+    if (s_settings) log_video("settings changed");
     s_settings = 0; s_armed = 0;
     if (s_win) ShowWindow(s_win, SW_HIDE);
 }
@@ -510,9 +513,61 @@ static void tick(void)
     }
 }
 
-/* The pushbuffer thread, at the end of every flip. */
 /* The game is paused while a menu is up, so no new frame then is not a freeze (mvc2_diag.c). */
 int mvc2_overlay_active(void) { return s_active; }
+
+/* Every video setting in effect and the window it is shown in, for the log's [VIDEO] lines (mvc2_diag.c): at the first
+ * frame, when the settings menu closes, when the window changes, and in every freeze or crash report. */
+void mvc2_overlay_video_line(char *out, size_t n)
+{
+    HWND game = xbox_fb_window();
+    RECT r = {0, 0, 0, 0};
+    HMONITOR mon = game ? MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST) : NULL;
+    MONITORINFOEXA mi;
+    DEVMODEA dm;
+    const char *mode = getenv("RECOMPLAUNCHER_MODE");
+    int hz = 0;
+
+    if (game) GetClientRect(game, &r);
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (mon && GetMonitorInfoA(mon, (MONITORINFO *)&mi) && EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+        hz = (int)dm.dmDisplayFrequency;
+    snprintf(out, n, "render scale %s, upscaling %s, sprite filter %s (smoothing %s, sharpen %s), %s %ldx%ld at %d Hz "
+             "(window size setting %dx), stretch %s, vsync %s, hi-res textures %s%s, RecompLauncher %s",
+             SET_RES[s_scale - 1], SET_OFFON[s_upscaling], SET_SPRITE[s_sprite], SET_LEVEL[s_smooth], SET_LEVEL[s_sharpen],
+             xbox_fb_is_fullscreen() ? "fullscreen" : "window", (long)r.right, (long)r.bottom, hz,
+             cfg_get("window_scale", 2), SET_OFFON[s_stretch], SET_OFFON[s_vsync], SET_OFFON[s_hires],
+             mvc2_pack_count() ? "" : " (no pack installed)", mode && *mode ? mode : "no");
+}
+
+/* Written only when something differs from the last [VIDEO] line, so opening and closing the menu without changing
+ * anything adds nothing. */
+static void log_video(const char *why)
+{
+    static char last[512];
+    char line[512];
+    SYSTEMTIME st;
+    mvc2_overlay_video_line(line, sizeof line);
+    if (!strcmp(line, last))
+        return;
+    strcpy(last, line);
+    GetLocalTime(&st);
+    fprintf(stderr, "[VIDEO] %02d:%02d:%02d %s: %s\n", st.wHour, st.wMinute, st.wSecond, why, line);
+}
+
+/* F11, Alt+Enter and the menu's Fullscreen line all end here; the player build saves the choice first. */
+static void (*s_prev_fullscreen_changed)(int);
+static void fullscreen_changed(int fullscreen)
+{
+    if (s_prev_fullscreen_changed)
+        s_prev_fullscreen_changed(fullscreen);
+    log_video(fullscreen ? "fullscreen on" : "fullscreen off");
+}
+
+/* The pushbuffer thread, at the end of every flip. */
 
 void mvc2_overlay_flip_wait(void)
 {
@@ -542,6 +597,12 @@ void mvc2_overlay_init(void)
     if (s_sharpen < 0 || s_sharpen > 2) s_sharpen = 0;
     mvc2_video_request(s_scale, s_hires, s_sprite, s_smooth, s_sharpen);
     xbox_input_back_start = 1;
+    s_prev_fullscreen_changed = xbox_fb_fullscreen_changed;
+    xbox_fb_fullscreen_changed = fullscreen_changed;
     xbox_fb_key_hook = key_hook;
     xbox_fb_tick_hook = tick;
 }
+
+/* The first [VIDEO] line, written by mvc2_diag.c once the game is up; through log_video so later lines are only
+ * written when something differs from it. */
+void mvc2_overlay_log_video(const char *why) { log_video(why); }
