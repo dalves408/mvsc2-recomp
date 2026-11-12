@@ -364,7 +364,7 @@ void mvc2_diag_build_line(void)
           sz = sizeof disp; RegQueryValueExA(k, "DisplayVersion", NULL, NULL, (BYTE *)disp, &sz);
           sz = sizeof ubr; RegQueryValueExA(k, "UBR", NULL, NULL, (BYTE *)&ubr, &sz);
           /* ProductName says "Windows 10" on Windows 11 too; build 22000 and later is 11 */
-          if (atoi(build) >= 22000 && !strncmp(name, "Windows 10", 10)) name[8] = '1';
+          if (atoi(build) >= 22000 && !strncmp(name, "Windows 10", 10)) name[9] = '1';
           snprintf(os, sizeof os, "%s %s (%s.%lu)", name, disp, build, (unsigned long)ubr);
           RegCloseKey(k); } }
     memset(&dev, 0, sizeof dev);
@@ -374,7 +374,7 @@ void mvc2_diag_build_line(void)
     ms.dwLength = sizeof ms;
     GlobalMemoryStatusEx(&ms);
     { SYSTEM_INFO si; GetSystemInfo(&si);
-      putf("[BUILD] mvc2_recomp %s, symbols %s | %s | %s, %lu logical CPUs | %s | %llu GB\n", ver, pdb, os, cpu,
+      putf("[BUILD] mvc2_recomp %s, symbols %s | %s | %s, %lu logical CPUs | display %s | %llu GB\n", ver, pdb, os, cpu,
            (unsigned long)si.dwNumberOfProcessors, gpu, (unsigned long long)((ms.ullTotalPhys + (1ull << 29)) >> 30)); }
 }
 

@@ -529,7 +529,7 @@ static void do_report(HWND h)
     reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName", osname, sizeof osname);
     reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion", disp, sizeof disp);
     reg_str(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuild", build, sizeof build);
-    if (atoi(build) >= 22000 && !strncmp(osname, "Windows 10", 10)) osname[8] = '1';   /* 11 still says "10" there */
+    if (atoi(build) >= 22000 && !strncmp(osname, "Windows 10", 10)) osname[9] = '1';   /* 11 still says "10" there */
     memset(&dev, 0, sizeof dev);
     dev.cb = sizeof dev;
     for (i = 0; EnumDisplayDevicesA(NULL, i, &dev, 0); i++)
