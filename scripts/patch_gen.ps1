@@ -4,7 +4,7 @@ param([switch]$DpcGuard, [switch]$Hoplat)
 $ErrorActionPreference = 'Stop'
 $enc = New-Object System.Text.UTF8Encoding($false)
 function Edit-Sub($name, $marker, [scriptblock]$edit) {
-  $f = Get-ChildItem C:\Recomp\mvc2_pc\src\recomp\gen\recomp_*.c | Where-Object { Select-String -Path $_.FullName -Pattern "void $name\(void\)" -Quiet }
+  $f = Get-ChildItem (Join-Path $PSScriptRoot '..\src\recomp\gen\recomp_*.c') | Where-Object { Select-String -Path $_.FullName -Pattern "void $name\(void\)" -Quiet }
   if (-not $f) { throw "$name not found in generated code" }
   $c = [IO.File]::ReadAllText($f.FullName)
   if ($c.Contains($marker)) { "$name : already patched ($marker)"; return }
@@ -66,6 +66,23 @@ Edit-Sub 'sub_0004F1A0' 'mvc2_anim_probe(0)' {
 Edit-Sub 'sub_0004F280' 'mvc2_anim_probe(1)' {
   param($c)
   return (Sub1 $c '(void sub_0004F280\(void\)\r?\n\{\r?\n(?:[^\r\n]*\r?\n){3,6}?    \(void\)_fa; \(void\)_fb; \(void\)_fas; \(void\)_fbs;\r?\n)' ('$1    { extern void mvc2_anim_probe(int); mvc2_anim_probe(1); }' + "`n") 'anim4')
+}
+
+# "Unlock everything" (src/mvc2_unlocks.c, settings.ini [game] unlock_all). The player's own unlocks are kept: they are
+# read after the game sets its defaults (sub_001DEBA0, no save yet) and after it loads the save (sub_001E04D0 calls the
+# loader sub_001DFB40), everything is then switched on in memory, and the save writer (sub_001E06B0) gets the player's
+# own values back just before it computes the save's checksums.
+Edit-Sub 'sub_001DEBA0' 'mvc2_unlocks_after_load' {
+  param($c)
+  return (Sub1 $c '(    MEM8\(0x5FA260\) = LO8\(ebx\);\r?\n)(    POP32\(esp, ebx\);\r?\n    esp \+= 4; return;)' ('$1    { extern void mvc2_unlocks_after_load(void); mvc2_unlocks_after_load(); }' + "`n" + '$2') 'unlocks defaults')
+}
+Edit-Sub 'sub_001E04D0' 'mvc2_unlocks_after_load' {
+  param($c)
+  return (Sub1 $c '(    PUSH32\(esp, 0x001E0695u\); RECOMP_ABI_CALL\(0x001DFB40u, sub_001DFB40\); /\* call 0x001DFB40 \*/\r?\n)' ('$1    { extern void mvc2_unlocks_after_load(void); mvc2_unlocks_after_load(); }' + "`n") 'unlocks load')
+}
+Edit-Sub 'sub_001E06B0' 'mvc2_unlocks_before_save' {
+  param($c)
+  return (Sub1 $c '(loc_001E0CA2: ;\r?\n)' ('$1    { extern void mvc2_unlocks_before_save(void); mvc2_unlocks_before_save(); }' + "`n") 'unlocks save')
 }
 
 # P1 (opt-in, -DpcGuard): the cancel DPC (sub_002C6908) must survive "the request already retired".

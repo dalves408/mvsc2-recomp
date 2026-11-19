@@ -17,7 +17,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
 - Xbox One, Series and 360 controllers through XInput: up to 4 players, hot-plug and rumble.
-- A Setup that copies the game files from your own disc image or folder, a settings program (`config.exe`) with Video, Controls and Textures tabs, and [RecompLauncher](https://recomplauncher.com/sdk) support up to Level 3.
+- A Setup that copies the game files from your own disc image or folder, a settings program (`config.exe`) with Video, Controls, Textures and Extras tabs, and [RecompLauncher](https://recomplauncher.com/sdk) support up to Level 3.
 
 ## Installing
 
@@ -48,7 +48,13 @@ The keyboard always counts as player 1, alongside any controller. The keys above
 
 The game pauses while a menu is open. In a menu, Up/Down chooses, Left/Right changes, Enter or A confirms, and Esc or B closes. Render scale and hi-res textures apply when the menu closes.
 
-Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`: the video options and the hi-res texture switch in `[display]`, your keys in `[keys]`. Saves are in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting; `desktop` uses the saved setting.
+Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`: the video options and the hi-res texture switch in `[display]`, your keys in `[keys]`, Unlock everything in `[game]`. Saves are in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting; `desktop` uses the saved setting.
+
+## Unlock everything
+
+Normally 24 characters are playable at first, and the other 32, the extra colors, the stages and the gallery artworks are bought with points in the Secret Factor shop. **Unlock everything** makes all of them available at once, including the three-of-the-same-character teams that open up once every character and color is unlocked. Switch it on in the Extras tab of `config.exe`, the F1 menu, or RecompLauncher's settings. It takes effect the next time the game starts; the F1 menu says when a restart is needed.
+
+Your save isn't changed. The game still records only what you've bought yourself, and switching the option off brings back exactly your own unlocks and points.
 
 ## Reporting a problem
 

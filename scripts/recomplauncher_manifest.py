@@ -52,6 +52,9 @@ def manifest():
         setting('vsync', 'VSync', 'display/vsync', toggle, 1),
         setting('hires-textures', 'Hi-res textures', 'display/hires_textures', toggle, 1,
                 'Only has an effect when a texture pack is installed.'),
+        setting('unlock-all', 'Unlock everything', 'game/unlock_all', toggle, 0,
+                'All 56 characters, every extra color, all stages and gallery artworks, without spending points. '
+                'Your save is not changed: switching it off brings back your own progress.'),
     ]
     return {
         '$schema': 'https://recomplauncher.com/schema/recomplauncher.json',

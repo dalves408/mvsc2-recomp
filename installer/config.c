@@ -6,6 +6,7 @@
  * (see src/mvc2_keymap.h).
  * Textures tab: the hi-res texture pack's on/off switch ([display] hires_textures, the F1 menu's Hi-res textures),
  * greyed out with a download button when the pack is not installed.
+ * Extras tab: Unlock everything ([game] unlock_all; the game applies it when it starts, src/mvc2_unlocks.c).
  * Report a problem: opens the logs folder (the game's own logs, %LOCALAPPDATA%\MvC2Recomp\logs) with the newest
  * selected, and a new GitHub issue filled in with the game version and the PC. */
 #ifndef WIN32_LEAN_AND_MEAN
@@ -78,12 +79,16 @@ static const VideoOpt VIDEO[NVIDEO] = {
 };
 
 enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200,
-       ID_TEX_MASTER = 300, ID_TEX_DL = 320, ID_REPORT = 330 };
-enum { PAGE_VIDEO, PAGE_CONTROLS, PAGE_TEXTURES };
+       ID_TEX_MASTER = 300, ID_TEX_DL = 320, ID_REPORT = 330, ID_UNLOCK = 340 };
+enum { PAGE_VIDEO, PAGE_CONTROLS, PAGE_TEXTURES, PAGE_EXTRAS };
 
 static int s_tex_on = 1, s_tex_installed;
 static HWND s_tpage[16], s_tmaster, s_tdl, s_tinfo;
 static int s_nt;
+/* Extras tab: Unlock everything ([game] unlock_all, read by the game when it starts: src/mvc2_unlocks.c) */
+static int s_unlock_on;
+static HWND s_epage[8], s_eunlock;
+static int s_ne;
 
 static int s_key[MVC2_KEYMAP_COUNT][2];
 static int s_vsel[NVIDEO];                    /* chosen index of each video option */
@@ -209,6 +214,20 @@ static void load_textures(void)
     s_tex_installed = pack_installed();
 }
 
+static void load_extras(void)
+{
+    char path[MAX_PATH];
+    ini_path(path, sizeof path, 0);
+    s_unlock_on = GetPrivateProfileIntA("game", "unlock_all", 0, path) != 0;
+}
+
+static int save_extras(void)
+{
+    char path[MAX_PATH];
+    ini_path(path, sizeof path, 1);
+    return WritePrivateProfileStringA("game", "unlock_all", s_unlock_on ? "1" : "0", path);
+}
+
 static int save_textures(void)
 {
     char path[MAX_PATH];
@@ -317,6 +336,11 @@ static void show_page(int page)
     for (i = 0; i < s_nv; i++) ShowWindow(s_vpage[i], page == PAGE_VIDEO ? SW_SHOW : SW_HIDE);
     for (i = 0; i < s_nc; i++) ShowWindow(s_cpage[i], page == PAGE_CONTROLS ? SW_SHOW : SW_HIDE);
     for (i = 0; i < s_nt; i++) ShowWindow(s_tpage[i], page == PAGE_TEXTURES ? SW_SHOW : SW_HIDE);
+    for (i = 0; i < s_ne; i++) ShowWindow(s_epage[i], page == PAGE_EXTRAS ? SW_SHOW : SW_HIDE);
+    if (page == PAGE_EXTRAS) {
+        status("Extras: changes apply the next time the game starts.");
+        return;
+    }
     if (page == PAGE_TEXTURES) {
         status(s_tex_installed
                ? "Textures: the hi-res pack is installed. Changes apply the next time the game starts."
@@ -346,6 +370,10 @@ static void do_reset(void)
             SendMessageA(s_vcombo[i], CB_SETCURSEL, (WPARAM)s_vsel[i], 0);
         }
         status("Default video settings restored. Click Save to keep them.");
+    } else if (s_page == PAGE_EXTRAS) {
+        s_unlock_on = 0;
+        SendMessageA(s_eunlock, BM_SETCHECK, BST_UNCHECKED, 0);
+        status("Unlock everything switched off. Click Save to keep it.");
     } else if (s_page == PAGE_TEXTURES) {
         s_tex_on = 1;
         tex_sync();
@@ -361,7 +389,7 @@ static void do_reset(void)
 
 static int do_save(void)
 {
-    if (!save_video() || !save_keys() || !save_textures()) {
+    if (!save_video() || !save_keys() || !save_textures() || !save_extras()) {
         MessageBoxA(s_main, "The settings could not be saved.", TITLE, MB_ICONERROR);
         return 0;
     }
@@ -399,6 +427,7 @@ static void make_ui(HWND h)
     ti.pszText = "Video";    SendMessageA(s_tab, TCM_INSERTITEMA, 0, (LPARAM)&ti);
     ti.pszText = "Controls"; SendMessageA(s_tab, TCM_INSERTITEMA, 1, (LPARAM)&ti);
     ti.pszText = "Textures"; SendMessageA(s_tab, TCM_INSERTITEMA, 2, (LPARAM)&ti);
+    ti.pszText = "Extras";   SendMessageA(s_tab, TCM_INSERTITEMA, 3, (LPARAM)&ti);
 
     /* Video tab: a name and a drop-down for each option */
     s_vpage[s_nv++] = mk("STATIC", "Video options. These are the same as the game's F1 menu, plus the window size; set them here before "
@@ -453,6 +482,19 @@ static void make_ui(HWND h)
     s_tpage[s_nt++] = mk("STATIC", "The F1 menu in the game has the same switch, Hi-res textures, to turn the pack on or off while you play.",
                          SS_LEFT, 30, 470, 540, 40, 0, f);
     tex_sync();
+
+    /* Extras tab: Unlock everything */
+    s_epage[s_ne++] = mk("STATIC", "Unlock everything the Secret Factor shop sells, without spending points: all 56 characters, "
+                                   "every extra color, all stages and every gallery artwork. With all characters and colors "
+                                   "unlocked you can also pick the same character three times on one team.",
+                         SS_LEFT, 30, 52, 540, 70, 0, f);
+    s_eunlock = mk("BUTTON", "Unlock everything", WS_TABSTOP | BS_AUTOCHECKBOX, 40, 128, 400, 24, ID_UNLOCK, f);
+    SendMessageA(s_eunlock, BM_SETCHECK, s_unlock_on ? BST_CHECKED : BST_UNCHECKED, 0);
+    s_epage[s_ne++] = s_eunlock;
+    s_epage[s_ne++] = mk("STATIC", "Your own progress is kept: your save is not changed, and switching this off brings back exactly "
+                                   "what you had unlocked and your points. The game's F1 menu has the same switch; either way it "
+                                   "takes effect the next time the game starts.",
+                         SS_LEFT, 30, 168, 540, 70, 0, f);
 
     /* below the tabs: status line and the buttons for every page */
     s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 558, 580, 34, ID_STATUS, f);
@@ -587,6 +629,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
             return 0;
         }
+        if (LOWORD(w) == ID_UNLOCK) {
+            if (HIWORD(w) == BN_CLICKED) {
+                s_unlock_on = SendMessageA(s_eunlock, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                s_dirty = 1;
+                status("Changed. Click Save to keep it; it applies the next time the game starts.");
+            }
+            return 0;
+        }
         if (LOWORD(w) == ID_TEX_MASTER) {
             if (HIWORD(w) == BN_CLICKED) {
                 s_tex_on = SendMessageA(s_tmaster, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -669,6 +719,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     load_keys();
     load_video();
     load_textures();
+    load_extras();
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
