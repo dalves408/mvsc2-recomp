@@ -48,6 +48,8 @@ WelcomeLabel2=This installs the Marvel vs. Capcom 2 PC recompilation.%n%nThe gam
 [Files]
 Source: "{#BuildDir}\mvc2_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
+; controllers (SDL3, zlib license): the game needs it beside mvc2_recomp.exe
+Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\mvc2_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 ; the hi-res texture pack's download helper, run from Setup's temp folder when the texture task is chosen
