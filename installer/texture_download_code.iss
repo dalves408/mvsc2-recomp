@@ -5,7 +5,8 @@
   (resumable) into %LOCALAPPDATA%\MvC2Recomp\Downloads\<part SHA-256>. Every part must match its pinned size and
   SHA-256 before anything is extracted. The parts are extracted into a staging folder, the result is checked against
   the pinned manifest, and only then swapped into texture_pack. /REPAIRTEXTURES=1 reinstalls a current pack,
-  /KEEPTEXTUREBIN=0 or 1 answers the keep-the-download question, /HIRES=yes selects the game Setup's texture task. }
+  /KEEPTEXTUREBIN=1 keeps the download after a successful install (the default, and =0, deletes it; the question
+  defaults to deleting), /HIRES=yes selects the game Setup's texture task. }
 var
   TextureProgress: TOutputProgressWizardPage;
   TextureTransferActive, TextureTransferCancelled, TextureExtractActive: Boolean;
@@ -375,14 +376,17 @@ begin
     if TexturePartCaches[I] <> '' then Any := True;
   if not TexturePackInstalled or TexturePackAlreadyCurrent or TextureCacheChoiceAsked or not Any then Exit;
   TextureCacheChoiceAsked := True;
+  { The default is to delete the download once the pack is installed: it is only needed to reinstall without
+    downloading again. Keeping it is the choice: No in the question, or /KEEPTEXTUREBIN=1. A copy the player put
+    beside Setup is never in TexturePartCaches, so it is never deleted. }
   Choice := ExpandConstant('{param:KEEPTEXTUREBIN|}');
-  if Choice = '0' then TextureDeleteCacheOnExit := True
-  else if (Choice = '1') or WizardSilent then TextureDeleteCacheOnExit := False
+  if Choice = '1' then TextureDeleteCacheOnExit := False
+  else if (Choice = '0') or WizardSilent then TextureDeleteCacheOnExit := True
   else
     TextureDeleteCacheOnExit := MsgBox(
-      'Keep the downloaded texture archive for future repairs or reinstalls?' + #13#10#13#10 +
-      'Yes keeps the cached download. No deletes it when Setup closes.',
-      mbConfirmation, MB_YESNO) = IDNO;
+      'The hi-res textures are installed. Delete the downloaded texture archive ({#TextureDownloadBytes / 1000000} MB) now?' + #13#10#13#10 +
+      'Yes deletes it when Setup closes. No keeps it, so a repair or reinstall does not have to download it again.',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES;
   if TextureDeleteCacheOnExit then Log('The user chose to delete the cached texture archive on Setup exit.')
   else Log('The cached texture archive is kept for future repairs or reinstalls.');
 end;

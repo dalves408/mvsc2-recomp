@@ -99,7 +99,7 @@ def manifest():
             {'id': 'open-logs', 'label': 'Open the logs folder', 'open': 'logs',
              'help': 'One log per run, the last three kept. Attach the newest to a problem report.'},
             {'id': 'clear-downloads', 'label': 'Delete saved texture downloads', 'clear': 'data/Downloads',
-             'help': 'The texture pack archives the installers kept for repairs. The installed textures stay.'},
+             'help': 'Texture pack downloads you chose to keep for repairs (Setup deletes them by default). The installed textures stay.'},
         ],
         'exit_codes': {
             '2': 'The disc image or folder could not be found.',

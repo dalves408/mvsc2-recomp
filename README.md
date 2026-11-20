@@ -27,7 +27,7 @@ Download from [Releases](https://github.com/dalves408/mvsc2-recomp/releases):
 - **`MvC2-HiRes-Textures-<n>-Setup.exe`**, on the `textures-<n>` release, adds the hi-res texture pack to an installed game.
 - **`MvC2-v<version>-Windows-x64.zip`** is for RecompLauncher, which sets the game up from your disc itself.
 
-Both Setups use a `texture-01.bin` placed beside them instead of downloading it, resume an interrupted download, and check the file's size and SHA-256 before installing.
+Both Setups use a `texture-01.bin` placed beside them instead of downloading it, resume an interrupted download, and check the file's size and SHA-256 before installing. After a successful install they delete the download unless you choose to keep it for repairs (`/KEEPTEXTUREBIN=1` when installing silently).
 
 ## Controls
 
