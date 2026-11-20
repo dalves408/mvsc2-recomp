@@ -43,6 +43,14 @@
 #include "mvc2_debug.h"
 #include "mvc2_diag.h"
 
+/* Laptops with two GPUs (NVIDIA Optimus, AMD switchable graphics): ask the driver for the dedicated one. Windows would
+ * otherwise start the game on its default adapter, often the integrated GPU, and every D3D11 device here (the
+ * renderer and the window's presenter) is created on the default adapter, so both follow this. A player can still
+ * choose otherwise in Windows' graphics settings or the NVIDIA/AMD control panel. Exported by the exe on purpose:
+ * the drivers look for these two names. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
  * the individual headers directly:
