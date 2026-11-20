@@ -1,0 +1,64 @@
+diff --git a/src/input/sdl3_pad.c b/src/input/sdl3_pad.c
+index 764df2b..e42444b 100644
+--- a/src/input/sdl3_pad.c
++++ b/src/input/sdl3_pad.c
+@@ -57,18 +57,40 @@ static int slot_of(SDL_JoystickID id)
+     return -1;
+ }
+ 
+-/* Close pads that went away, open new ones into the lowest free ports. */
++/* Close pads that went away, move the rest down to the lowest ports, open new ones into the lowest free ports.
++ *
++ * The moving matters because the title's first controller port is always plugged in (the keyboard is player 1) and
++ * only ports 2-4 follow the host pads (ohci.c). Left where they were, the pads after an unplugged one keep their
++ * ports: pull out pad 1 of two and the other stays player 2, so the title still sees two players with one pad in
++ * hand. Moved down, it becomes player 1 and port 2 empties, which the title sees as that controller removed. */
+ static void scan_locked(void)
+ {
+     SDL_JoystickID *ids;
+-    int i, n = 0;
++    int i, j, n = 0, gone = 0;
+ 
+     for (i = 0; i < NPADS; i++)
+         if (s_pad[i] && !SDL_GamepadConnected(s_pad[i])) {
+             fprintf(stderr, "  [PAD] host pad %d disconnected\n", i);
+             SDL_CloseGamepad(s_pad[i]);
+             s_pad[i] = NULL;
++            gone = 1;
+         }
++    for (i = 0; gone && i < NPADS; i++) {
++        if (s_pad[i])
++            continue;
++        for (j = i + 1; j < NPADS && !s_pad[j]; j++)
++            ;
++        if (j == NPADS)
++            break;
++        s_pad[i] = s_pad[j];
++        s_last[i] = s_last[j];
++        s_packet[i] = s_packet[j] + 1;          /* a new number: the state may differ from what port i had */
++        s_pad[j] = NULL;
++        memset(&s_last[j], 0, sizeof s_last[j]);
++        SDL_SetGamepadPlayerIndex(s_pad[i], i);
++        fprintf(stderr, "  [PAD] host pad %d moved to Xbox controller port %d (a lower port was unplugged)\n",
++                j, i + 1);
++    }
+ 
+     ids = SDL_GetGamepads(&n);
+     for (i = 0; ids && i < n; i++) {
+diff --git a/src/input/sdl3_pad.h b/src/input/sdl3_pad.h
+index 3e48194..1ee04ae 100644
+--- a/src/input/sdl3_pad.h
++++ b/src/input/sdl3_pad.h
+@@ -10,8 +10,10 @@
+  * Buttons are by position (Xbox layout): the bottom face button is A, the
+  * right one B, the left one X, the top one Y, whatever the pad prints on
+  * them. Guide, touchpad (touch and click), share/misc and paddles are not
+- * read. Up to 4 pads take ports 0-3 in the order they appear; a pad that
+- * is unplugged frees its port, and the next pad takes the lowest free one.
++ * read. Up to 4 pads take ports 0-3 in the order they appear; when one is
++ * unplugged the pads after it move down a port, so the pads in hand are
++ * always players 1, 2, ... with no gap, and the next pad takes the lowest
++ * free port.
+  * All calls are safe from any thread.
+  */
+ #ifndef XBOXRECOMP_SDL3_PAD_H
