@@ -75,6 +75,7 @@ set(GAME_SOURCES
     src/mvc2_keymap.c
     src/mvc2_diag.c
     src/mvc2_unlocks.c
+    src/mvc2_paths.c
     src/sprite_filter.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c

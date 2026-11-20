@@ -1,5 +1,5 @@
 /* config.exe -- the player's settings program, installed next to the game. Everything is kept in
- * %LOCALAPPDATA%\MvC2Recomp\settings.ini and read when the game starts.
+ * data\settings.ini beside the game (the install is portable) and read when the game starts.
  *
  * Video tab: the same options as the game's F1 menu, plus the window size; saved in [display].
  * Controls tab: a keyboard remapper. Each Xbox control has a key and an alternate key, saved in [keys]
@@ -7,7 +7,7 @@
  * Textures tab: the hi-res texture pack's on/off switch ([display] hires_textures, the F1 menu's Hi-res textures),
  * greyed out with a download button when the pack is not installed.
  * Extras tab: Unlock everything ([game] unlock_all; the game applies it when it starts, src/mvc2_unlocks.c).
- * Report a problem: opens the logs folder (the game's own logs, %LOCALAPPDATA%\MvC2Recomp\logs) with the newest
+ * Report a problem: opens the logs folder (the game's own logs, data\logs) with the newest
  * selected, and a new GitHub issue filled in with the game version and the PC. */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -145,7 +145,19 @@ static int has_textures(const char *dir, int depth)
     return found;
 }
 
-/* The pack the installer put next to this program, or one in the player's own folder (where the game also looks) */
+/* The game's data folder: "data" beside this program, which Setup installs next to the game (the install is
+ * portable: settings, saves and logs all live there, see src/mvc2_paths.c). */
+static void data_dir(char *out, size_t n, int create_dir)
+{
+    char *sl;
+    if (!GetModuleFileNameA(NULL, out, (DWORD)n - 8) || (sl = strrchr(out, '\\')) == NULL)
+        snprintf(out, n, ".\\data");
+    else
+        strcpy(sl, "\\data");
+    if (create_dir) CreateDirectoryA(out, NULL);
+}
+
+/* The pack the installer put next to this program, or one in the data folder (where the game also looks) */
 static int pack_installed(void)
 {
     char d[MAX_PATH], *sl;
@@ -153,21 +165,16 @@ static int pack_installed(void)
         strcpy(sl, "\\texture_pack");
         if (has_textures(d, 0)) return 1;
     }
-    if (GetEnvironmentVariableA("LOCALAPPDATA", d, sizeof d - 40)) {
-        strcat(d, "\\MvC2Recomp\\texture_pack");
-        if (has_textures(d, 0)) return 1;
-    }
-    return 0;
+    data_dir(d, sizeof d - 16, 0);
+    strcat(d, "\\texture_pack");
+    return has_textures(d, 0);
 }
 
 static void ini_path(char *out, size_t n, int create_dir)
 {
-    char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base))
-        strcpy(base, ".");
-    snprintf(out, n, "%s\\MvC2Recomp", base);
-    if (create_dir) CreateDirectoryA(out, NULL);
-    snprintf(out, n, "%s\\MvC2Recomp\\settings.ini", base);
+    char dir[MAX_PATH];
+    data_dir(dir, sizeof dir, create_dir);
+    snprintf(out, n, "%s\\settings.ini", dir);
 }
 
 /* ---- load and save --------------------------------------------------------------------------- */
@@ -542,10 +549,8 @@ static void do_report(HWND h)
     MEMORYSTATUSEX ms;
     DWORD i, sz, hnd;
 
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base)) strcpy(base, ".");
-    snprintf(logs, sizeof logs, "%s\\MvC2Recomp", base);
-    CreateDirectoryA(logs, NULL);
-    snprintf(logs, sizeof logs, "%s\\MvC2Recomp\\logs", base);
+    data_dir(base, sizeof base, 1);
+    snprintf(logs, sizeof logs, "%s\\logs", base);
     CreateDirectoryA(logs, NULL);
     snprintf(pat, sizeof pat, "%s\\mvc2-*.log", logs);
     if ((f = FindFirstFileA(pat, &fd)) != INVALID_HANDLE_VALUE) {

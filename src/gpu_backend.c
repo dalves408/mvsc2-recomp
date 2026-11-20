@@ -676,7 +676,7 @@ static int tex_ok(const Nv2aTexture *t)
     return 0;
 }
 /* ---- hi-res texture pack ---------------------------------------------------
- * <16 hex digits of pixel_hash>_<16 hex digits of alpha_hash>*.dds or .png in %LOCALAPPDATA%\MvC2Recomp\texture_pack or a texture_pack folder
+ * <16 hex digits of pixel_hash>_<16 hex digits of alpha_hash>*.dds or .png in data\texture_pack or a texture_pack folder
  * next to the exe (subfolders allowed) replace the decoded texture of that hash, any size. The hash covers the decoded
  * colours only, so a pack can be made from the disc without running the game. The game can draw the same colours with
  * other alpha than the disc holds, so a replacement whose alpha_hash differs is not used: the original is drawn instead. The pack only holds stages and menus:
@@ -736,10 +736,11 @@ int mvc2_pack_count(void)
     if (!s_pack_scanned) {
         char dir[MAX_PATH], *sl;
         s_pack_scanned = 1;
-        if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) && strlen(dir) < MAX_PATH - 40) {
-            strcat(dir, "\\MvC2Recomp\\texture_pack");
-            pack_scan(dir, 0);
-        }
+        { extern const char *mvc2_data_dir(void);
+          if (strlen(mvc2_data_dir()) < MAX_PATH - 20) {
+              snprintf(dir, sizeof dir, "%s\\texture_pack", mvc2_data_dir());
+              pack_scan(dir, 0);
+          } }
         if (GetModuleFileNameA(NULL, dir, MAX_PATH) && (sl = strrchr(dir, '\\')) != NULL && (size_t)(sl - dir) < MAX_PATH - 20) {
             strcpy(sl, "\\texture_pack");
             pack_scan(dir, 0);
@@ -999,7 +1000,8 @@ static void texdump(const Nv2aTexture *t)
         if (j < nper) { if (per[j].n >= 100) return; per_slot = &per[j].n; }
     }
     h = hash_bytes(mem + t->offset, tex_bytes(t));
-    if (t->color == 0x0B && t->palette) h ^= hash_bytes(mem + t->palette, 1024) * 31u;
+    if (t->color == 0x0B && t->palette) h ^= hash_bytes(mem + t->palette, 1024) * 31u;
+
     for (k = 0; k < nseen; k++) if (seen[k] == h) return;
     if (nseen == 16384) return;
     seen[nseen++] = h;

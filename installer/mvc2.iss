@@ -2,8 +2,10 @@
 ; Built by:
 ;   python scripts/build_installer.py --version <version> (it runs the steps below)
 ; Output: installer\Output\MvC2-Setup-<version>.exe
-; If the game is already installed (its game files are in place), Setup only updates the program files:
-; it does not ask for the disc and does not copy the 252 MB of game files again.
+; The install is portable: the game, its data folder (saves, settings, logs) and the texture pack are all in the
+; install folder. There is no uninstaller, no Programs and Features entry and nothing in the registry; deleting the
+; folder (and the shortcuts) removes the game. If the folder chosen on the folder page already holds the game, Setup
+; only updates the program files: it does not ask for the disc and does not copy the 252 MB of game files again.
 #ifndef AppVersion
 #define AppVersion "1.0.0"
 #endif
@@ -21,9 +23,13 @@ AppPublisherURL=https://github.com/dalves408/mvsc2-recomp
 DefaultDirName=C:\Games\Marvel vs. Capcom 2
 DefaultGroupName=Marvel vs. Capcom 2
 DisableProgramGroupPage=yes
-; fresh install defaults to C:\Games\Marvel vs. Capcom 2; an existing install is found by AppId and its folder is pre-filled; the folder page is always shown so it can be changed
+; portable: no uninstaller and no Programs and Features entry, so no previous folder is remembered either. The folder
+; page always shows (default C:\Games\Marvel vs. Capcom 2) and an existing install is recognised in the folder chosen.
 DisableDirPage=no
-UsePreviousAppDir=yes
+UsePreviousAppDir=no
+Uninstallable=no
+CreateUninstallRegKey=no
+DirExistsWarning=no
 ; a running game or settings program is closed so its exe can be replaced
 CloseApplications=yes
 CloseApplicationsFilter=mvc2_recomp.exe,config.exe
@@ -34,7 +40,6 @@ MinVersion=10.0
 SetupIconFile=..\resources\mvc2.ico
 ; the picture at the top right of every wizard page is the same icon (the sizes are for different screen scalings)
 WizardSmallImageFile=wizard_small_55.bmp,wizard_small_64.bmp,wizard_small_80.bmp,wizard_small_96.bmp,wizard_small_128.bmp
-UninstallDisplayIcon={app}\mvc2_recomp.exe
 OutputBaseFilename=MvC2-Setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
@@ -66,11 +71,6 @@ Name: "{autodesktop}\Marvel vs. Capcom 2"; Filename: "{app}\mvc2_recomp.exe"; Wo
 Name: "hires"; Description: "Install the hi-res texture pack ({#TextureDownloadBytes / 1000000} MB download if needed)"; Flags: unchecked; Check: TexturePackNeedsInstall
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
-[UninstallDelete]
-Type: filesandordirs; Name: "{app}\game_files"
-; the hi-res texture pack (added by this Setup's texture task or by the texture addon)
-Type: filesandordirs; Name: "{app}\texture_pack"
-
 [Code]
 var
   SrcPage, UpdatePage: TWizardPage;
@@ -94,28 +94,29 @@ begin
             FileExists(Dir + '\game_files\xbox\AFS03.AFS');
 end;
 
-{ Where a previous Setup put the game, or '' }
-function PreviousAppDir: String;
+{ The version of the game in Dir, from its exe ('' when unknown) }
+function InstalledVersion(Dir: String): String;
 var
-  Key, Dir: String;
+  V: String;
 begin
   Result := '';
-  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7E3A1D4-5F26-4C89-A0D7-2E9C61F84B3A}_is1';
-  if RegQueryStringValue(HKCU, Key, 'Inno Setup: App Path', Dir) or
-     RegQueryStringValue(HKLM, Key, 'Inno Setup: App Path', Dir) then
-    Result := RemoveBackslashUnlessRoot(Dir);
+  if GetVersionNumbersString(Dir + '\mvc2_recomp.exe', V) then Result := V;
 end;
 
-{ The version a previous Setup recorded, or '' }
-function PreviousVersion: String;
+{ Saves and settings live in the install folder (data), so it must be writable: Program Files is not, without
+  administrator rights. A folder that did not exist is removed again after the test. }
+function DirWritable(Dir: String): Boolean;
 var
-  Key, V: String;
+  F: String;
+  Made: Boolean;
 begin
-  Result := '';
-  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7E3A1D4-5F26-4C89-A0D7-2E9C61F84B3A}_is1';
-  if RegQueryStringValue(HKCU, Key, 'DisplayVersion', V) or
-     RegQueryStringValue(HKLM, Key, 'DisplayVersion', V) then
-    Result := V;
+  Made := not DirExists(Dir);
+  Result := ForceDirectories(Dir);
+  if not Result then Exit;
+  F := AddBackslash(Dir) + 'mvc2_setup_write_test.tmp';
+  Result := SaveStringToFile(F, 'x', False);
+  DeleteFile(F);
+  if Made then RemoveDir(Dir);
 end;
 
 { The n-th dot-separated number of a version such as 1.0.2 (0 when missing) }
@@ -151,13 +152,14 @@ end;
 { The page that says what was found and asks the player to go ahead }
 var
   UpdY: Integer;
+  UpdPanel: TPanel;
 
 procedure AddLine(Text: String; Bold: Boolean);
 var
   L: TNewStaticText;
 begin
   L := TNewStaticText.Create(UpdatePage);
-  L.Parent := UpdatePage.Surface;
+  L.Parent := UpdPanel;
   L.AutoSize := False;
   L.WordWrap := True;
   L.Left := 0;
@@ -180,7 +182,7 @@ end;
 procedure AddChoice(var R: TNewRadioButton; Text: String; Checked: Boolean);
 begin
   R := TNewRadioButton.Create(UpdatePage);
-  R.Parent := UpdatePage.Surface;
+  R.Parent := UpdPanel;
   R.Left := 0;
   R.Top := UpdY;
   R.Width := UpdatePage.SurfaceWidth;
@@ -191,14 +193,28 @@ begin
   UpdY := UpdY + R.Height + ScaleY(6);
 end;
 
-procedure CreateUpdatePage;
+procedure FillUpdatePage;
 begin
+  { Rebuilt each time it is shown: Back on the folder page can choose another folder. }
+  if UpdPanel <> nil then UpdPanel.Free;
+  UpdPanel := TPanel.Create(UpdatePage);
+  UpdPanel.Parent := UpdatePage.Surface;
+  UpdPanel.BevelOuter := bvNone;
+  UpdPanel.Left := 0;
+  UpdPanel.Top := 0;
+  UpdPanel.Width := UpdatePage.SurfaceWidth;
+  UpdPanel.Height := UpdatePage.SurfaceHeight;
+  RepairRadio := nil;
+  QuitRadio := nil;
   if VerRel = 0 then
-    UpdatePage := CreateCustomPage(wpWelcome, 'This version is already installed',
-      'Setup found the same version of Marvel vs. Capcom 2 on this computer.')
-  else
-    UpdatePage := CreateCustomPage(wpWelcome, 'Marvel vs. Capcom 2 is already installed',
-      'Setup found an existing installation of the game on this computer.');
+  begin
+    WizardForm.PageNameLabel.Caption := 'This version is already installed';
+    WizardForm.PageDescriptionLabel.Caption := 'The folder you chose has the same version of Marvel vs. Capcom 2.';
+  end else
+  begin
+    WizardForm.PageNameLabel.Caption := 'Marvel vs. Capcom 2 is already installed';
+    WizardForm.PageDescriptionLabel.Caption := 'The folder you chose already has the game.';
+  end;
   UpdY := 0;
   AddLine('Installed in:  ' + OldDir, False);
   if OldVer <> '' then
@@ -250,17 +266,9 @@ var
   B1, B2: TNewButton;
 begin
   NewVer := '{#AppVersion}';
-  OldDir := PreviousAppDir;
-  UpdateMode := (OldDir <> '') and GameFilesPresent(OldDir);
-  if UpdateMode then
-  begin
-    OldVer := PreviousVersion;
-    if OldVer <> '' then VerRel := CompareVer(OldVer, NewVer) else VerRel := -1;
-    WizardForm.WelcomeLabel2.Caption :=
-      'Marvel vs. Capcom 2 is already installed on this computer.' + #13#10#13#10 +
-      'Setup will show the installed version and this Setup''s version on the next page and ask you to confirm before it changes anything.';
-    CreateUpdatePage;
-  end;
+  { Shown after the folder page, only when that folder already holds the game (filled by FillUpdatePage). }
+  UpdatePage := CreateCustomPage(wpSelectDir, 'Marvel vs. Capcom 2 is already installed',
+    'The folder you chose already has the game.');
   SrcPage := CreateCustomPage(wpSelectDir, 'Your copy of the game',
     'Select the disc image or folder that Setup should copy the game files from.');
   L := TNewStaticText.Create(SrcPage);
@@ -290,6 +298,7 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if UpdateMode and (CurPageID = UpdatePage.ID) then
   begin
+    FillUpdatePage;
     if VerRel = 0 then RadioClick(nil) else WizardForm.NextButton.Caption := 'Update';
   end
   else if UpdateMode and UpdateOnly and (CurPageID = wpFinished) then
@@ -345,7 +354,8 @@ end;
 { No disc is needed when the game files are already in the chosen folder. }
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = SrcPage.ID) and GameFilesPresent(WizardDirValue);
+  Result := ((PageID = SrcPage.ID) and GameFilesPresent(WizardDirValue)) or
+            ((PageID = UpdatePage.ID) and not GameFilesPresent(WizardDirValue));
 end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
@@ -357,7 +367,24 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if UpdateMode and (VerRel = 0) and (CurPageID = UpdatePage.ID) and QuitRadio.Checked then
+  if CurPageID = wpSelectDir then
+  begin
+    if not DirWritable(RemoveBackslashUnlessRoot(WizardDirValue)) then
+    begin
+      MsgBox('Setup cannot write to this folder. The game keeps its saves and settings inside its own folder, so ' +
+             'choose one you can write to, such as C:\Games\Marvel vs. Capcom 2 (not Program Files).', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    OldDir := RemoveBackslashUnlessRoot(WizardDirValue);
+    UpdateMode := GameFilesPresent(OldDir);
+    if UpdateMode then
+    begin
+      OldVer := InstalledVersion(OldDir);
+      if OldVer <> '' then VerRel := CompareVer(OldVer, NewVer) else VerRel := -1;
+    end;
+  end;
+  if UpdateMode and (VerRel = 0) and (CurPageID = UpdatePage.ID) and (QuitRadio <> nil) and QuitRadio.Checked then
   begin
     QuitNow := True;
     WizardForm.Close;
@@ -427,12 +454,4 @@ begin
   Result := 0;
   if not GameFilesPresent(ExpandConstant('{app}')) or (WantTexturePack and not TexturePackInstalled) then
     Result := 1;
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  { The texture pack's Programs and Features entry goes with the game (the pack has no uninstaller of its own). }
-  if CurUninstallStep = usPostUninstall then
-    RegDeleteKeyIncludingSubkeys(HKCU,
-      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#PackGuid}}_is1');
 end;

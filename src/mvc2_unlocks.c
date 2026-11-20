@@ -45,12 +45,8 @@ static uint8_t s_stages;
 
 static int ini_path(char *out, size_t n)
 {
-    char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
-        return 0;
-    snprintf(out, n, "%s\\MvC2Recomp", base);
-    CreateDirectoryA(out, NULL);
-    snprintf(out, n, "%s\\MvC2Recomp\\settings.ini", base);
+    extern const char *mvc2_data_dir(void);
+    snprintf(out, n, "%s\\settings.ini", mvc2_data_dir());
     return 1;
 }
 

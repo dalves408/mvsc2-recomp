@@ -1,4 +1,4 @@
-/* The player's own keyboard keys. config.exe writes them to %LOCALAPPDATA%\MvC2Recomp\settings.ini, [keys]
+/* The player's own keyboard keys. config.exe writes them to data\settings.ini beside the game, [keys]
  * (see mvc2_keymap.h); they are read once, when the game starts, and a key missing from the file keeps the
  * toolkit's default. */
 #define WIN32_LEAN_AND_MEAN
@@ -28,9 +28,8 @@ void mvc2_keymap_init(void)
 
     if (xbox_key_map_count != MVC2_KEYMAP_COUNT)        /* the toolkit's table changed: keep its own keys */
         return;
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
-        return;
-    snprintf(path, sizeof path, "%s\\MvC2Recomp\\settings.ini", base);
+    { extern const char *mvc2_data_dir(void); snprintf(path, sizeof path, "%s\\settings.ini", mvc2_data_dir()); }
+    (void)base;
     for (i = 0; i < MVC2_KEYMAP_COUNT; i++) {
         int k0, k1;
         snprintf(key, sizeof key, "%s", ids[i]);

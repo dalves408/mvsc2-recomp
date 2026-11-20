@@ -13,7 +13,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 - Direct3D 11 rendering, with three render scales: Original, Medium and High.
 - An upscaler (Lanczos resampling and contrast-adaptive sharpening) for when the picture is shown larger than it is drawn.
 - Sprite filters for the characters: xBR, OmniScale or ScaleFX, with optional smoothing and sharpening. Stages are left alone.
-- An optional hi-res texture pack for stages and menus, installed by Setup or by its own addon (see Installing). The game also reads DDS or PNG files named by hashes of their colors and transparency from `texture_pack` beside the game or in `%LOCALAPPDATA%\MvC2Recomp\texture_pack`.
+- An optional hi-res texture pack for stages and menus, installed by Setup or by its own addon (see Installing). The game also reads DDS or PNG files named by hashes of their colors and transparency from `texture_pack` beside the game or in `data\texture_pack`.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
 - Xbox One, Series and 360 controllers through XInput: up to 4 players, hot-plug and rumble.
@@ -23,9 +23,11 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 
 Download from [Releases](https://github.com/dalves408/mvsc2-recomp/releases):
 
-- **`MvC2-Setup-<version>.exe`** installs the game (to `C:\Games\Marvel vs. Capcom 2` by default) and copies the game files from your own disc image (`.iso` or `.xiso`) or folder. Run over an existing install, it updates or repairs the program files and keeps your game files, saves and settings. Its optional **hi-res texture pack** task downloads the pack (634 MB) and installs it.
+- **`MvC2-Setup-<version>.exe`** installs the game (to `C:\Games\Marvel vs. Capcom 2` by default) and copies the game files from your own disc image (`.iso` or `.xiso`) or folder. Pointed at a folder that already has the game, it updates or repairs the program files and keeps your game files, saves and settings. Its optional **hi-res texture pack** task downloads the pack (634 MB) and installs it.
 - **`MvC2-HiRes-Textures-<n>-Setup.exe`**, on the `textures-<n>` release, adds the hi-res texture pack to an installed game.
 - **`MvC2-v<version>-Windows-x64.zip`** is for RecompLauncher, which sets the game up from your disc itself.
+
+The game is **portable**: everything it needs and everything it saves stays in its own folder. Your saves, settings and logs are in `data` inside it, and there is no uninstaller, no entry in Windows' Apps list and nothing in the registry. To move the game, move the folder; to remove it, delete the folder and its Start menu and desktop shortcuts. Choose a folder you can write to (Setup refuses Program Files). Saves from 1.0.0 to 1.0.2, kept in `%LOCALAPPDATA%\MvC2Recomp`, aren't carried over.
 
 Both Setups use a `texture-01.bin` placed beside them instead of downloading it, resume an interrupted download, and check the file's size and SHA-256 before installing. After a successful install they delete the download unless you choose to keep it for repairs (`/KEEPTEXTUREBIN=1` when installing silently).
 
@@ -48,7 +50,7 @@ The keyboard always counts as player 1, alongside any controller. The keys above
 
 The game pauses while a menu is open. In a menu, Up/Down chooses, Left/Right changes, Enter or A confirms, and Esc or B closes. Render scale and hi-res textures apply when the menu closes.
 
-Settings are saved in `%LOCALAPPDATA%\MvC2Recomp\settings.ini`: the video options and the hi-res texture switch in `[display]`, your keys in `[keys]`, Unlock everything in `[game]`. Saves are in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting; `desktop` uses the saved setting.
+Settings are saved in `data\settings.ini` in the game's folder: the video options and the hi-res texture switch in `[display]`, your keys in `[keys]`, Unlock everything in `[game]`. Saves are in `SaveData` beside it. `RECOMPLAUNCHER_MODE=bigpicture` starts fullscreen without changing the saved setting; `desktop` uses the saved setting.
 
 ## Unlock everything
 
@@ -58,7 +60,7 @@ Your save isn't changed. The game still records only what you've bought yourself
 
 ## Reporting a problem
 
-Each run writes a log to `%LOCALAPPDATA%\MvC2Recomp\logs` (the last three runs are kept). If the game freezes for 10 seconds or crashes, the log also records where each part of the game was at that moment, which is usually enough to find the cause. Logging runs in the background and doesn't affect the game's speed. Your Windows user name is blanked out in the log.
+Each run writes a log to `data\logs` in the game's folder (the last three runs are kept). If the game freezes for 10 seconds or crashes, the log also records where each part of the game was at that moment, which is usually enough to find the cause. Logging runs in the background and doesn't affect the game's speed. Your Windows user name is blanked out in the log.
 
 - **RecompLauncher:** its report button sends the newest log for you.
 - **Otherwise:** click **Report a problem** in the settings program (`config.exe`). It opens the logs folder with the newest log selected, and a new [GitHub issue](https://github.com/dalves408/mvsc2-recomp/issues) already filled in with the game version and your PC details. Say what happened, drag the log onto the page and submit it. GitHub needs a free account.

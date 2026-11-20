@@ -5,7 +5,7 @@
  * underneath, dimmed. While it is up the keyboard and controller 1 go to the overlay and the game is paused: its
  * pushbuffer thread waits in the flip (mvc2_overlay_flip_wait), the sound holds its place, and every pad reads neutral.
  *
- * Choices are saved at once in %LOCALAPPDATA%\MvC2Recomp\settings.ini, [display]. Render scale and hi-res textures
+ * Choices are saved at once in data\settings.ini beside the game (mvc2_paths.c), [display]. Render scale and hi-res textures
  * apply when the game resumes; the others at once.
  *
  * Keys: F1 settings, Esc quit prompt. In them: Up/Down choose, Left/Right change, Enter confirms, Esc closes; Y and N in
@@ -47,12 +47,8 @@ static void log_video(const char *why);
 
 static int cfg_path(char *out, size_t n)
 {
-    char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
-        return 0;
-    snprintf(out, n, "%s\\MvC2Recomp", base);
-    CreateDirectoryA(out, NULL);
-    snprintf(out, n, "%s\\MvC2Recomp\\settings.ini", base);
+    extern const char *mvc2_data_dir(void);
+    snprintf(out, n, "%s\\settings.ini", mvc2_data_dir());
     return 1;
 }
 

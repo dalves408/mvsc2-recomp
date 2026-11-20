@@ -2,7 +2,7 @@
   The caller includes texture_payload.iss first, for the pinned Texture* constants.
 
   For each part: use the copy beside Setup if it is the right one, else the cached download, else download it
-  (resumable) into %LOCALAPPDATA%\MvC2Recomp\Downloads\<part SHA-256>. Every part must match its pinned size and
+  (resumable) into the game's data\Downloads\<part SHA-256> (the install is portable: nothing outside its folder). Every part must match its pinned size and
   SHA-256 before anything is extracted. The parts are extracted into a staging folder, the result is checked against
   the pinned manifest, and only then swapped into texture_pack. /REPAIRTEXTURES=1 reinstalls a current pack,
   /KEEPTEXTUREBIN=1 keeps the download after a successful install (the default, and =0, deletes it; the question
@@ -29,8 +29,6 @@ function TextureTick: LongWord;
 
 function GetFileAttributes(FileName: String): LongWord;
   external 'GetFileAttributesW@kernel32.dll stdcall';
-
-procedure RegisterTexturePackEntry(AppDir: String); forward;
 
 function TextureForceRepair: Boolean;
 begin
@@ -341,7 +339,6 @@ begin
   TexturePackInstalled := TexturePackAlreadyCurrent;
   if TexturePackAlreadyCurrent then begin
     Log('The current texture pack is already installed; no download or extraction is needed.');
-    RegisterTexturePackEntry(WizardDirValue);
     Exit;
   end;
   if not GetSpaceOnDisk64(AddBackslash(ExtractFileDrive(WizardDirValue)), FreeBytes, TotalBytes) then begin
@@ -412,35 +409,6 @@ begin
   Result := not TextureTransferCancelled;
 end;
 
-const
-  TexturePackKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#PackGuid}}_is1';
-
-{ The addon is extraction-only (no uninstaller of its own), so Programs and Features gets its entry here, with the
-  revision as its version. The game's uninstaller removes it along with texture_pack. }
-procedure RegisterTexturePackEntry(AppDir: String);
-var
-  SizeKB: Int64;
-begin
-  AppDir := RemoveBackslashUnlessRoot(AppDir);
-  if AppDir = '' then Exit;
-  if not RegWriteStringValue(HKCU, TexturePackKey, 'DisplayName', 'Marvel vs. Capcom 2 Hi-Res Textures') then begin
-    Log('Could not register the hi-res texture pack in Programs and Features.');
-    Exit;
-  end;
-  RegWriteStringValue(HKCU, TexturePackKey, 'DisplayVersion', '{#TextureDisplayVersion}');
-  RegWriteStringValue(HKCU, TexturePackKey, 'Publisher', 'dalves408/mvsc2-recomp');
-  RegWriteStringValue(HKCU, TexturePackKey, 'URLInfoAbout', 'https://github.com/dalves408/mvsc2-recomp');
-  RegWriteStringValue(HKCU, TexturePackKey, 'InstallLocation', AddBackslash(AppDir));
-  RegWriteStringValue(HKCU, TexturePackKey, 'Inno Setup: App Path', AppDir);
-  RegWriteStringValue(HKCU, TexturePackKey, 'DisplayIcon', AddBackslash(AppDir) + 'mvc2_recomp.exe');
-  RegWriteDWordValue(HKCU, TexturePackKey, 'NoModify', 1);
-  RegWriteDWordValue(HKCU, TexturePackKey, 'NoRepair', 1);
-  SizeKB := {#TextureExtractedBytes} div 1024;
-  if SizeKB > $FFFFFFFF then SizeKB := $FFFFFFFF;
-  RegWriteDWordValue(HKCU, TexturePackKey, 'EstimatedSize', SizeKB);
-  Log('Registered hi-res textures as {#TextureDisplayVersion} in Programs and Features.');
-end;
-
 { An existing texture_pack this Setup recognises (an earlier copy of this revision) can be deleted after the swap;
   anything else the player put there is kept beside it. }
 function TextureKnownPack(PackDir: String): Boolean;
@@ -503,7 +471,6 @@ begin
           if not DelTree(Backup, True, True, True) then Log('Old texture backup remains at ' + Backup);
         end else Log('Previous texture folder preserved at ' + Backup);
       end;
-      RegisterTexturePackEntry(AppDir);
       Log('{#TextureDisplayVersion} texture pack extraction completed.');
     except
       if TextureTransferCancelled then

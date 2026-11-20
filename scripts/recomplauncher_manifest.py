@@ -18,7 +18,7 @@ from pathlib import Path
 # not been checked, so they are not listed.
 DUMPS = [{'name': 'Marvel vs. Capcom 2: New Age of Heroes', 'size': 7825162240, 'crc32': '8caa7541'}]
 
-DATA = '{local}/MvC2Recomp'     # %LOCALAPPDATA%\MvC2Recomp: settings.ini and SaveData (the game's own choice)
+DATA = '{install}/data'        # data beside the game: settings.ini, SaveData, logs (the install is portable)
 
 
 def manifest():

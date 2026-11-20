@@ -163,7 +163,7 @@ def main():
     define('TextureExtractedBytes', info['extracted_bytes'])
     define('TextureManifestSHA256', f'"{info["manifest_sha256"]}"')
     define('TextureFileCount', len(entries))
-    define('TextureCacheRoot', '"{localappdata}\\MvC2Recomp\\Downloads"')
+    define('TextureCacheRoot', '"{app}\\data\\Downloads"')
     define('TexturePartCount', len(parts))
     define('TextureDownloadBytes', sum(x['bytes'] for x in info['parts']))
     for i, x in enumerate(info['parts'], 1):

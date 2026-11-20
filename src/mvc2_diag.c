@@ -1,6 +1,6 @@
 /* mvc2_diag.c - what a player's problem report needs, in every build, at no cost while the game plays.
  *
- *   log file      the player build copies everything it prints to %LOCALAPPDATA%\MvC2Recomp\logs\mvc2-<date>-<time>.log
+ *   log file      the player build copies everything it prints to data\logs\mvc2-<date>-<time>.log beside the game
  *                 and passes it on to the original stdout/stderr, which RecompLauncher captures for its crash report.
  *                 The last three runs are kept, a log stops taking routine lines at 20 MB, the long per-texture and
  *                 per-method tables are left out, and the Windows user name is replaced by %USERPROFILE%/%USERNAME%.

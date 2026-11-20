@@ -382,7 +382,7 @@ static DWORD WINAPI mvc2_scan_thread(LPVOID u)
 
 #ifdef MVC2_RELEASE
 /* The player build (cmake -DMVC2_RELEASE=ON). The game files sit next to the exe, whatever folder it was started from;
- * saves and settings go to %LOCALAPPDATA%\MvC2Recomp; the developer switches (RECOMP_*) from outside are ignored. */
+ * saves, settings and logs go to the data folder beside it (mvc2_paths.c: the install is portable); the developer switches (RECOMP_*) from outside are ignored. */
 static char s_player_ini[MAX_PATH];     /* settings.ini: [display] fullscreen, window_scale (config.exe writes it too) */
 static char s_partition_dir[MAX_PATH];  /* the emulated disk's sparse images, kept out of SaveData */
 
@@ -413,14 +413,11 @@ static void player_setup(void)
         snprintf(name, sizeof name, "%.*s", (int)(strchr(*e, '=') - *e), *e);
         _putenv_s(name, "");
     }
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 60)
-        strcpy(base, ".");
-    snprintf(path, sizeof path, "%s\\MvC2Recomp", base);
-    CreateDirectoryA(path, NULL);
-    mvc2_diag_log_start(path);          /* from here on everything printed is also in MvC2Recomp\logs */
-    snprintf(s_player_ini, sizeof s_player_ini, "%s\\MvC2Recomp\\settings.ini", base);
-    snprintf(s_partition_dir, sizeof s_partition_dir, "%s\\MvC2Recomp\\Partitions", base);
-    snprintf(path, sizeof path, "%s\\MvC2Recomp\\SaveData", base);
+    { extern const char *mvc2_data_dir(void); snprintf(base, sizeof base, "%s", mvc2_data_dir()); }
+    mvc2_diag_log_start(base);          /* from here on everything printed is also in data\logs */
+    snprintf(s_player_ini, sizeof s_player_ini, "%s\\settings.ini", base);
+    snprintf(s_partition_dir, sizeof s_partition_dir, "%s\\Partitions", base);
+    snprintf(path, sizeof path, "%s\\SaveData", base);
     _putenv_s("RECOMP_SAVE_DIR", path);
     _putenv_s("RECOMP_NO_KERNEL_LOG", "1");
     _putenv_s("RECOMP_FB_PLAIN_TITLE", "Marvel vs. Capcom 2");

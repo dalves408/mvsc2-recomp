@@ -19,7 +19,7 @@
 #define TextureFileCount 1018
 #endif
 #ifndef TextureCacheRoot
-#define TextureCacheRoot "{localappdata}\MvC2Recomp\Downloads"
+#define TextureCacheRoot "{app}\data\Downloads"
 #endif
 #ifndef TexturePartCount
 #define TexturePartCount 1

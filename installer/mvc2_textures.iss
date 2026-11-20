@@ -1,12 +1,10 @@
 ; Standalone, extraction-only Setup for the hi-res texture pack (the same flow as NHL Hitz Pro's addon).
-; Built by scripts/build_installer.py. It finds the installed game, downloads the pack's .bin parts
+; Built by scripts/build_installer.py. It finds the game folder (beside this EXE, or C:\Games\Marvel vs. Capcom 2,
+; or the one the player picks: the game is portable and not registered anywhere), downloads the pack's .bin parts
 ; (or uses the ones beside it), checks them against texture_payload.iss and extracts them into texture_pack.
 #include "texture_payload.iss"
 #ifndef BuildDir
 #define BuildDir "..\build_release\Release"
-#endif
-#ifndef GameGuid
-#define GameGuid "B7E3A1D4-5F26-4C89-A0D7-2E9C61F84B3A"
 #endif
 
 [Setup]
@@ -53,25 +51,20 @@ Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: replacesameversion
 
 [Code]
 #include "texture_download_code.iss"
-const
-  GameKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#GameGuid}}_is1';
-
 function GameExists(Dir: String): Boolean;
 begin
   Result := FileExists(Dir + '\mvc2_recomp.exe');
 end;
 
+{ The game is portable (no registry entry): the folder this EXE was started from when it is the game folder, else
+  the default install folder, else '' and the player picks it on the folder page. }
 function FindGameDir: String;
-var Dir: String;
 begin
   Result := '';
-  if RegQueryStringValue(HKCU, GameKey, 'Inno Setup: App Path', Dir) then
-    if GameExists(RemoveBackslashUnlessRoot(Dir)) then
-      Result := RemoveBackslashUnlessRoot(Dir);
-  if Result = '' then
-    if RegQueryStringValue(HKLM, GameKey, 'Inno Setup: App Path', Dir) then
-      if GameExists(RemoveBackslashUnlessRoot(Dir)) then
-        Result := RemoveBackslashUnlessRoot(Dir);
+  if GameExists(RemoveBackslashUnlessRoot(ExpandConstant('{src}'))) then
+    Result := RemoveBackslashUnlessRoot(ExpandConstant('{src}'))
+  else if GameExists('C:\Games\Marvel vs. Capcom 2') then
+    Result := 'C:\Games\Marvel vs. Capcom 2';
 end;
 
 function GameDir(Param: String): String;
