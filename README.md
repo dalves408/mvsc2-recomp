@@ -16,7 +16,7 @@ The game's Xbox executable is disassembled and translated to C, then built with 
 - An optional hi-res texture pack for stages and menus, installed by Setup or by its own addon (see Installing). The game also reads DDS or PNG files named by hashes of their colors and transparency from `texture_pack` beside the game or in `data\texture_pack`.
 - Borderless fullscreen, windowed, and a choice of 4:3 or stretched picture.
 - Game speed locked at 60 FPS, because MvC2's speed is tied to its frame rate.
-- Xbox One, Series and 360 controllers through XInput: up to 4 players, hot-plug and rumble.
+- Controllers through SDL3: Xbox, PlayStation 3/4/5, Switch Pro and most other pads work natively, with no Steam Input or DS4Windows needed. Up to 4 players, hot-plug, rumble and analog triggers.
 - A Setup that copies the game files from your own disc image or folder, a settings program (`config.exe`) with Video, Controls, Textures and Extras tabs, and [RecompLauncher](https://recomplauncher.com/sdk) support up to Level 3.
 
 ## Installing
@@ -40,7 +40,19 @@ Both Setups use a `texture-01.bin` placed beside them instead of downloading it,
 | Backspace | Back | | W A S D | Left stick |
 | Z / X / C / V | A / B / X / Y | | Left Shift / Left Ctrl | Left / Right thumb click |
 
-The keyboard always counts as player 1, alongside any controller. The keys above are the defaults: the Controls tab of the settings program (`config.exe`, "Marvel vs. Capcom 2 Settings" in the Start menu) gives each Xbox control a key and an alternate key. PlayStation and Switch pads need Steam Input or DS4Windows to appear as XInput. The game's own CONFIG menu rebinds its buttons.
+The keyboard always counts as player 1, alongside any controller. The keys above are the defaults: the Controls tab of the settings program (`config.exe`, "Marvel vs. Capcom 2 Settings" in the Start menu) gives each Xbox control a key and an alternate key. The game's own CONFIG menu rebinds its buttons.
+
+Controllers are read through SDL3, so Xbox, PlayStation, Switch and most other USB or Bluetooth pads work as they are. Up to 4 take players 1-4 in the order they are connected; one that is unplugged frees its slot for the next. Buttons go by position, as on an Xbox pad:
+
+| Controller | In the game |
+|---|---|
+| Bottom / right / left / top face button (Xbox A B X Y, PlayStation Cross Circle Square Triangle, Switch B A Y X) | A / B / X / Y |
+| Left / right bumper (L1 / R1, L / R) | Black / White |
+| Left / right trigger (L2 / R2, ZL / ZR) | Left / right trigger, analog |
+| Sticks, stick clicks, D-pad | The same; the left stick also works as the D-pad |
+| Start / Back (Options / Share or Create, + / -) | Start / Back |
+
+The PlayStation touchpad, the Guide or PS button and other extra buttons do nothing, and the mouse pointer is hidden over the game window.
 
 | Key | What it does |
 |---|---|
@@ -69,13 +81,14 @@ Report right after the problem, before starting the game again three more times,
 
 ## Building
 
-You need Windows 10 or 11 x64, Visual Studio 2022 C++ Build Tools, CMake, Python 3.12 with `capstone`, and your own copy of the game. To build the installer you also need Inno Setup 6 and Pillow.
+You need Windows 10 or 11 x64, Visual Studio 2022 C++ Build Tools, CMake, Python 3.12 with `capstone`, [SDL3](https://github.com/libsdl-org/SDL/releases) (the `SDL3-devel-<version>-VC.zip` package, 3.4.20 or later), and your own copy of the game. To build the installer you also need Inno Setup 6 and Pillow.
 
 The scripts assume this layout. If yours differs, edit the paths in `scripts/regen.ps1`.
 
 ```
 C:\Recomp\mvc2_pc              this repo
 C:\Recomp\tools\xboxrecomp     the toolkit
+C:\Recomp\tools\SDL3-3.4.20    SDL3-devel-3.4.20-VC.zip unpacked (or pass -DSDL3_DIR=<its cmake folder>)
 C:\Recomp\MvsC2\extracted      your extracted game files (default.xbe and data)
 ```
 
@@ -112,7 +125,7 @@ This builds the player version in `build_release`, with the C runtime linked in 
 1. The [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit parses the XBE, finds its functions and translates them to C.
 2. The game writes NV2A pushbuffers directly. The toolkit's executor decodes them on its own thread and runs the game's vertex programs, and `src/gpu_backend.c` draws the result with Direct3D 11.
 3. The window presents each frame on its own thread, so the display cannot hold up the game.
-4. Input is an emulated Xbox USB gamepad, fed from XInput and the keyboard.
+4. Input is an emulated Xbox USB gamepad, fed from SDL3 controllers and the keyboard.
 5. Guest threads share one host core, like the console's one CPU, and code that relied on that is handled explicitly: raised IRQL exclusion, thread priorities, and read-modify-write instructions as one atomic step.
 
 | Path | Contents |
@@ -135,6 +148,7 @@ This builds the player version in `build_release`, with the C runtime linked in 
 ## Credits and legal
 
 - [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) provides the recompilation toolkit, under the MIT license.
+- [SDL3](https://libsdl.org/) reads the controllers; `SDL3.dll` ships beside the game, under the zlib license.
 - The sprite filters are ports of OmniScale by Lior Halphon, ScaleFX by Sp00kyFox and xBR by Hyllian, from [libretro/slang-shaders](https://github.com/libretro/slang-shaders), each under MIT; their notices are in `src/sprite_filter.c`.
 - This project's own code is under the [MIT license](LICENSE). That license does not cover the game or anything generated from it.
 - Marvel vs. Capcom 2 is the property of Capcom and Marvel. This project is unofficial and is not affiliated with either company.

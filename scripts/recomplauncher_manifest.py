@@ -127,7 +127,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     archive = args.out / f'MvC2-v{args.version}-Windows-x64.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as package:
-        for name in ('mvc2_recomp.exe', 'mvc2_import.exe', 'config.exe'):
+        for name in ('mvc2_recomp.exe', 'SDL3.dll', 'mvc2_import.exe', 'config.exe'):
             package.write(args.build / name, name)
         package.writestr('recomplauncher.json', text)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()

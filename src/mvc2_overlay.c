@@ -12,7 +12,7 @@
  * the prompt. Controller 1: Back + Start opens settings, D-pad or left stick moves, A confirms, B or Start closes.
  */
 #include <windows.h>
-#include <xinput.h>
+#include <xinput.h>   /* XINPUT_STATE and its button bits only: the pad is read through the toolkit */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +32,8 @@ extern void mvc2_video_request(int scale, int hires, int sprite_filter, int smoo
 extern int mvc2_pack_count(void);
 extern int mvc2_unlocks_setting(void), mvc2_unlocks_active(void);
 extern void mvc2_unlocks_set(int on);
+/* Controller 1 as the game reads it (SDL3, toolkit patch 0024), before mapping: XINPUT_STATE layout, so any pad works. */
+extern DWORD xbox_InputHostState(DWORD port, void *state);
 
 static volatile int s_active;
 static int s_settings, s_sel, s_armed, s_quit_yes;
@@ -453,7 +455,7 @@ static void pad_overlay_poll(void)
     WORD b, press, dirs;
     DWORD now = GetTickCount();
 
-    if (XInputGetState(0, &st) != ERROR_SUCCESS) { prev = 0; s_pad_valid = 1; return; }
+    if (xbox_InputHostState(0, &st) != ERROR_SUCCESS) { prev = 0; s_pad_valid = 1; return; }
     b = st.Gamepad.wButtons;
     if (st.Gamepad.sThumbLX < -16000) b |= XINPUT_GAMEPAD_DPAD_LEFT;
     if (st.Gamepad.sThumbLX > 16000)  b |= XINPUT_GAMEPAD_DPAD_RIGHT;
@@ -498,7 +500,7 @@ static void tick(void)
     }
     if (s_unblock_wait) {                           /* the press that closed it is not also a press in the game */
         XINPUT_STATE st;
-        if (XInputGetState(0, &st) != ERROR_SUCCESS
+        if (xbox_InputHostState(0, &st) != ERROR_SUCCESS
             || (st.Gamepad.wButtons == 0 && st.Gamepad.sThumbLX > -16000 && st.Gamepad.sThumbLX < 16000
                 && st.Gamepad.sThumbLY > -16000 && st.Gamepad.sThumbLY < 16000)
             || GetTickCount() - s_unblock_t > 2000) {
@@ -508,7 +510,7 @@ static void tick(void)
         }
     } else {                                        /* Back + Start, either one first: settings */
         XINPUT_STATE st;
-        int chord = XInputGetState(0, &st) == ERROR_SUCCESS
+        int chord = xbox_InputHostState(0, &st) == ERROR_SUCCESS
                     && (st.Gamepad.wButtons & XINPUT_GAMEPAD_BACK) && (st.Gamepad.wButtons & XINPUT_GAMEPAD_START);
         if (chord && !s_chord_held)
             open_overlay(1);
