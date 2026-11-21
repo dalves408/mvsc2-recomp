@@ -5,6 +5,8 @@
  *                 The last three runs are kept, a log stops taking routine lines at 20 MB, the long per-texture and
  *                 per-method tables are left out, and the Windows user name is replaced by %USERPROFILE%/%USERNAME%.
  *   [BUILD]       one line at start: version, symbol-file id, Windows, CPU, GPU, memory.
+ *   [PERF]        every 10 s: frame rate, the game's and the whole PC's CPU load, the load on the game's core and the
+ *                 driver time (DPC, interrupts) there, the busiest threads. [POWER] once: power plan, battery or not.
  *   [VIDEO]       every video setting in effect, the window size and the monitor's refresh rate: once when the game
  *                 is up, when a setting changes during play (the settings menu closing with something changed, F11 or
  *                 Alt+Enter: mvc2_overlay.c), and in every freeze or crash report. Nothing polls for it.
@@ -61,10 +63,19 @@ static int have_pdb(void)
 {
     if (s_have_pdb < 0) {
         IMAGEHLP_MODULE64 m;
+        char buf[sizeof(SYMBOL_INFO) + 64];
+        SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+        DWORD64 d = 0, base = (DWORD64)(uintptr_t)GetModuleHandleA(NULL);
+        /* Symbols load on first use (SYMOPT_DEFERRED_LOADS), so look one up before asking what kind they are. Only
+         * a .pdb counts: without one dbghelp falls back on the exe's exports (the two GPU-preference names in
+         * main.c) and would name every address after them. */
+        memset(buf, 0, sizeof buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 63;
+        SymFromAddr(GetCurrentProcess(), base + 0x1000, &d, sym);
         memset(&m, 0, sizeof m);
         m.SizeOfStruct = sizeof m;
-        s_have_pdb = SymGetModuleInfo64(GetCurrentProcess(), (DWORD64)(uintptr_t)GetModuleHandleA(NULL), &m) &&
-                     (m.SymType == SymPdb);
+        s_have_pdb = SymGetModuleInfo64(GetCurrentProcess(), base, &m) && (m.SymType == SymPdb);
     }
     return s_have_pdb;
 }
@@ -489,16 +500,163 @@ static void freeze_report(unsigned secs, uint32_t frames, int verbose)
 static unsigned s_freeze_secs;
 static int s_verbose;
 
+/* ---- [PERF] -------------------------------------------------------------------------------------------------------
+ * Every 10 s: the frame rate, how much of the PC the game uses and how busy the whole PC is, the load on the core the
+ * game's own threads run on (they share one, as on the console) including the time Windows spends there on drivers
+ * (DPC and interrupt time), and the game's busiest threads. When the frame rate drops, this says whether the game is
+ * short of CPU time (its core busy with other work), one of its own threads is saturated, or neither. Thread start
+ * addresses are module+offset like the stacks (scripts/symbolize_log.py names them). Costs one thread walk per 10 s. */
+typedef struct { LARGE_INTEGER idle, kernel, user, dpc, isr; ULONG isr_count; } CorePerf;   /* SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION */
+typedef LONG (WINAPI *NtQSI)(ULONG, PVOID, ULONG, PULONG);
+typedef LONG (WINAPI *NtQIT)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+extern DWORD_PTR xbox_GuestCpuMask(void);
+
+#define PERF_MAX_THREADS 128
+static struct { DWORD tid; ULONGLONG cpu; } s_thr[PERF_MAX_THREADS];
+static int s_nthr;
+
+static ULONGLONG ft64(FILETIME f) { return ((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime; }
+
+static void perf_line(double secs, uint32_t frames)
+{
+    static NtQSI qsi;
+    static NtQIT qit;
+    static CorePerf prev_core[64];
+    static ULONGLONG prev_proc, prev_sys_busy, prev_sys_total;
+    static int primed;
+    struct { DWORD tid; ULONGLONG d; void *start; } top[5];
+    CorePerf core[64];
+    FILETIME c, e, k, u, si, sk, su;
+    ULONGLONG proc, sys_busy, sys_total, wall = (ULONGLONG)(secs * 1e7);
+    DWORD_PTR gmask = xbox_GuestCpuMask();
+    int ncpu, gcore = -1, i, j, n = 0, newn = 0;
+    char line[1600], where[160];
+    HANDLE snap;
+    THREADENTRY32 te;
+    static DWORD newtid[PERF_MAX_THREADS];
+    static ULONGLONG newcpu[PERF_MAX_THREADS];
+    SYSTEM_INFO sinfo;
+
+    if (!qsi) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        qsi = (NtQSI)GetProcAddress(nt, "NtQuerySystemInformation");
+        qit = (NtQIT)GetProcAddress(nt, "NtQueryInformationThread");
+    }
+    GetSystemInfo(&sinfo);
+    ncpu = (int)sinfo.dwNumberOfProcessors;
+    if (ncpu > 64) ncpu = 64;
+    for (i = 0; gmask && i < 64; i++) if ((gmask >> i) & 1) { gcore = i; break; }
+
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    proc = ft64(k) + ft64(u);
+    GetSystemTimes(&si, &sk, &su);
+    sys_total = ft64(sk) + ft64(su);                /* kernel includes idle */
+    sys_busy = sys_total - ft64(si);
+    memset(core, 0, sizeof core);
+    if (qsi) qsi(8, core, (ULONG)(sizeof(CorePerf) * ncpu), NULL);   /* SystemProcessorPerformanceInformation */
+
+    /* the game's threads: CPU time since the last line, busiest first */
+    memset(top, 0, sizeof top);
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    te.dwSize = sizeof te;
+    if (snap != INVALID_HANDLE_VALUE) {
+        BOOL ok;
+        for (ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+            HANDLE th;
+            FILETIME tc, tx, tk, tu;
+            ULONGLONG cpu, d = 0;
+            void *start = NULL;
+            if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            th = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!th) continue;
+            if (GetThreadTimes(th, &tc, &tx, &tk, &tu)) {
+                cpu = ft64(tk) + ft64(tu);
+                for (j = 0; j < s_nthr; j++) if (s_thr[j].tid == te.th32ThreadID) { d = cpu - s_thr[j].cpu; break; }
+                if (j == s_nthr) d = 0;              /* new since the last line: counted from the next one */
+                if (newn < PERF_MAX_THREADS) { newtid[newn] = te.th32ThreadID; newcpu[newn] = cpu; newn++; }
+                if (qit) qit(th, 9, &start, sizeof start, NULL);   /* ThreadQuerySetWin32StartAddress */
+                for (j = 0; j < 5; j++)
+                    if (d > top[j].d) {
+                        memmove(&top[j + 1], &top[j], sizeof top[0] * (4 - j));
+                        top[j].tid = te.th32ThreadID; top[j].d = d; top[j].start = start;
+                        break;
+                    }
+            }
+            CloseHandle(th);
+        }
+        CloseHandle(snap);
+    }
+    for (j = 0; j < newn; j++) { s_thr[j].tid = newtid[j]; s_thr[j].cpu = newcpu[j]; }
+    s_nthr = newn;
+
+    if (primed && wall) {
+        double game = 100.0 * (double)(proc - prev_proc) / (double)wall / ncpu;
+        double pc = sys_total > prev_sys_total ? 100.0 * (double)(sys_busy - prev_sys_busy) / (double)(sys_total - prev_sys_total) : 0;
+        n = snprintf(line, sizeof line, "[PERF] %.1f fps | game %.0f%% of the PC, whole PC %.0f%% busy (%d cores)",
+                     frames / secs, game, pc, ncpu);
+        if (gcore >= 0 && gcore < ncpu) {
+            CorePerf *a = &core[gcore], *b = &prev_core[gcore];
+            double tot = (double)((a->kernel.QuadPart + a->user.QuadPart) - (b->kernel.QuadPart + b->user.QuadPart));
+            if (tot > 0)
+                n += snprintf(line + n, sizeof line - n, " | game core cpu %d: %.0f%% busy, drivers %.0f%% DPC + %.0f%% interrupts",
+                              gcore, 100.0 * (tot - (double)(a->idle.QuadPart - b->idle.QuadPart)) / tot,
+                              100.0 * (double)(a->dpc.QuadPart - b->dpc.QuadPart) / tot,
+                              100.0 * (double)(a->isr.QuadPart - b->isr.QuadPart) / tot);
+        }
+        n += snprintf(line + n, sizeof line - n, " | busiest threads (%% of one core):");
+        for (j = 0; j < 5 && top[j].d && n < (int)sizeof line - 200; j++) {
+            mvc2_diag_where(top[j].start, where, sizeof where);
+            n += snprintf(line + n, sizeof line - n, " %s %.0f%%", where, 100.0 * (double)top[j].d / (double)wall);
+        }
+        snprintf(line + n, sizeof line - n, "\n");
+        put(line);
+    }
+    memcpy(prev_core, core, sizeof core);
+    prev_proc = proc; prev_sys_busy = sys_busy; prev_sys_total = sys_total;
+    primed = 1;
+}
+
+/* Once at start: the Windows power plan and whether the PC runs on battery (a saving plan or battery caps the CPU). */
+static void power_line(void)
+{
+    typedef DWORD (WINAPI *GetScheme)(HKEY, GUID **);
+    typedef DWORD (WINAPI *ReadName)(HKEY, const GUID *, const GUID *, const GUID *, UCHAR *, DWORD *);
+    HMODULE pp = LoadLibraryA("powrprof.dll");
+    GetScheme gs = pp ? (GetScheme)GetProcAddress(pp, "PowerGetActiveScheme") : NULL;
+    ReadName rn = pp ? (ReadName)GetProcAddress(pp, "PowerReadFriendlyName") : NULL;
+    SYSTEM_POWER_STATUS ps;
+    char name[128] = "?";
+    GUID *g = NULL;
+
+    if (gs && rn && !gs(NULL, &g) && g) {
+        WCHAR w[128];
+        DWORD sz = sizeof w;
+        if (!rn(NULL, g, NULL, NULL, (UCHAR *)w, &sz))
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, name, sizeof name, NULL, NULL);
+        LocalFree(g);
+    }
+    if (!GetSystemPowerStatus(&ps)) ps.ACLineStatus = 255;
+    putf("[POWER] plan %s, %s\n", name,
+         ps.ACLineStatus == 1 ? "plugged in" : ps.ACLineStatus == 0 ? "on battery" : "power source unknown");
+}
+
 static DWORD WINAPI watch_thread(LPVOID p)
 {
-    uint32_t last = mvc2_gpu_flips();
-    unsigned still = 0, reports = 0, total = 0;
+    uint32_t last = mvc2_gpu_flips(), perf_frames = last;
+    unsigned still = 0, reports = 0, total = 0, perf_tick = 0;
+    ULONGLONG perf_t = GetTickCount64();
     int video_logged = 0;
     (void)p;
+    power_line();
     for (;;) {
         uint32_t now;
         Sleep(1000);
         now = mvc2_gpu_flips();
+        if (++perf_tick % 10 == 0) {
+            ULONGLONG t = GetTickCount64();
+            perf_line((double)(t - perf_t) / 1000.0, now - perf_frames);
+            perf_t = t; perf_frames = now;
+        }
         if (now && !video_logged) {             /* once: the settings in use when the game is up */
             mvc2_overlay_log_video("start");
             video_logged = 1;
